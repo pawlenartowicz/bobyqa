@@ -1,0 +1,44 @@
+[package]
+name = "bobyqa"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+authors = ["Paweł Lenartowicz <pawellenartowicz@europe.com>"]
+description = "Dependency-free BOBYQA: derivative-free minimization of a box-constrained function from values alone — a faithful pure-Rust port of PRIMA."
+repository = "https://github.com/pawlenartowicz/bobyqa"
+documentation = "https://docs.rs/bobyqa"
+readme = "README.md"
+license = "MIT OR Apache-2.0"
+keywords = ["optimization", "bobyqa", "derivative-free", "minimization", "powell"]
+categories = ["mathematics", "science", "algorithms"]
+# The parity battery and its ~5 MB of frozen PRIMA trajectory/state dumps are a CI-only asset
+# ("freeze then forget", roadmap) — they live in git for CI but are not shipped to downstream users.
+exclude = ["tests/"]
+
+# No dependencies and no dev-dependencies through M1 (design §4): the golden parser is
+# hand-rolled, and the bit-exact parity discipline never needed `approx`.
+
+# `unsafe_code = "forbid"` deliberately lives in src/lib.rs (`#![forbid(unsafe_code)]`),
+# not here: [lints] applies to every target in the package, `forbid` cannot be
+# overridden by attributes, and tests/alloc.rs needs a dev-only
+# `unsafe impl GlobalAlloc` (design §8.2; rust.md §7).
+
+[features]
+# Dev-only kernel-invocation counter (Layer-0 spec §9 F0a). OFF by default: the shipped
+# library has no global mutable state (SPEC §1 aim 4). Mirrors tests/alloc.rs's dev-only shim.
+count-kernels = []
+
+[lints.rust]
+missing_docs = "deny" # M3: the public API is fully documented; an undocumented public item fails the build
+
+[lints.clippy]
+all = { level = "deny", priority = 0 }
+pedantic = { level = "warn", priority = -1 }
+float_cmp = { level = "allow", priority = 1 }           # golden tests compare exact-where-the-reference-is-exact
+cast_precision_loss = { level = "allow", priority = 1 } # usize<->f64 casts are routine in index/loop math
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1 # stable codegen across rebuilds; avoids FP-fusion reordering
+# target-cpu left unset (portable + wasm-clean); no -ffast-math

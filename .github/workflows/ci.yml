@@ -1,0 +1,51 @@
+# CI — the rust.md §13 checklist minus the v0.1.1+ no_std line, on stable.
+#
+# The test step IS the parity and allocation gate: the goldens live in-repo
+# (tests/goldens/), so PRIMA never builds here ("freeze then forget", roadmap).
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown, wasm32-wasip1
+      - uses: bytecodealliance/actions/wasmtime/setup@v1
+
+      # 1. Formatting.
+      - run: cargo fmt --check
+
+      # 2. Lints.
+      - run: cargo clippy --all-targets --locked -- -D warnings
+
+      # 3. Native tests — unit + parity battery (bit-exact goldens) + the SPEC §6.4
+      #    zero-allocation test — plus doctests.
+      - run: cargo test --all-targets --locked
+      # The kernel-invocation counter is feature-gated off by default (so the shipped lib carries
+      # no global state), which means --all-targets never runs it — exercise it explicitly here.
+      - run: cargo test --features count-kernels --test kernel_counts --locked
+      - run: cargo test --doc --locked
+
+      # 4. wasm build gate (SPEC §1.2 firm target; no JS glue — rust.md §9).
+      - run: cargo build --target wasm32-unknown-unknown --locked
+
+      # 5. wasm run gate (SPEC §6.5): the parity battery executes on wasm32-wasip1 under
+      #    wasmtime. The --dir identity mapping preopens the workspace so the
+      #    CARGO_MANIFEST_DIR-relative golden paths baked into the test binary resolve
+      #    inside the guest. Expectation: bit-exact, same as native (M2 design §7).
+      - run: cargo test --target wasm32-wasip1 --test parity_prima --locked
+        env:
+          CARGO_TARGET_WASM32_WASIP1_RUNNER: wasmtime run --dir ${{ github.workspace }}::${{ github.workspace }}
+
+      # 6. Bench compile check (rust.md §13) — vacuously green until benches exist.
+      - run: cargo bench --no-run --locked

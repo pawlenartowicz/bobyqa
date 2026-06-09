@@ -1,0 +1,19 @@
+# bobyqa state v1
+# prima 1d76fb88aeffb427cd17ed1e9d0d3b34f414913f
+routine trrad
+problem booth
+npt 5
+rho_begin 0.5
+rho_end 9.9999999999999995e-07
+max_fun 500
+seq 6
+entry
+scalar delta_in   4.8131139111078231E-001
+scalar dnorm   4.8131139111078231E-001
+scalar eta1   1.0000000000000001E-001
+scalar eta2   7.0000000000000007E-001
+scalar gamma1   5.0000000000000000E-001
+scalar gamma2   2.0000000000000000E+000
+scalar ratio   9.9407731747769645E-001
+exit
+scalar delta   9.6262278222156461E-001

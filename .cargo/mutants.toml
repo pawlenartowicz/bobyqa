@@ -1,0 +1,36 @@
+# cargo-mutants — on-request L1 fragility diagnostic for the numeric kernels.
+# See docs/plans/2026-06-09-test-suite-review.md (Phase 4). DIAGNOSTIC, not a gate:
+# no surviving-mutant-count floor. Run on request before a release, never in CI.
+#
+# Run from the crate dir:
+#   cargo mutants
+# (reads this file automatically). Survivors triage into equivalent / tolerance-masked
+# / genuine-gap — the bit-exact oracle (PARITY_TOL = 0.0, state tol 1e-14) keeps the
+# tolerance-masked bucket small, so most survivors are equivalent or real gaps.
+
+# Whitelist the load-bearing f64 numeric modules, where a flipped comparison or wrong
+# constant is most expensive. Deliberately out of scope: the public boundary (lib/util),
+# column-major storage (mat), the std-delegation seams (math), constants (consts), and
+# the test harness (test_support) — plumbing/storage, not numeric kernels.
+examine_globs = [
+    "src/linalg.rs",
+    "src/powalg.rs",
+    "src/initialize.rs",
+    "src/update.rs",
+    "src/geometry.rs",
+    "src/trustregion.rs",
+    "src/rescue.rs",
+    "src/bobyqb.rs",
+]
+
+# The `counters::{reset,bump,calvlag_noadd_calls}` functions in powalg.rs are gated behind the
+# `count-kernels` feature, which the default `cargo mutants` run does not build — so mutating them
+# can never be caught. They are measurement instrumentation (the F0a kernel-count diagnostic), not
+# numeric logic; exclude them so they don't show as spurious survivors.
+exclude_re = ["counters::"]
+
+# A flipped comparison in the trust-region / rescue iteration can stall convergence and
+# run long; bound each mutant's test time generously above the ~3s green baseline rather
+# than letting it hang.
+timeout_multiplier = 5.0
+minimum_test_timeout = 60

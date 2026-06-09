@@ -1,0 +1,6 @@
+# Rust build tree
+/target/
+
+# cargo-mutants per-run scratch output (the .cargo/mutants.toml config IS tracked)
+/mutants.out/
+/mutants.out.old/
