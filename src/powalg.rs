@@ -90,10 +90,13 @@ pub(crate) fn hess_mul_into(
     matprod21_into(xpt, dxpt, y);
     // PRIMA: if (present(hq)) then do j = 1, n: y = y + hq(:, j) * x(j).
     if let Some(hq) = hq {
+        // Length-equalized reslices: bounds-check-free, independent lanes.
+        let y = &mut y[..n];
         for j in 0..n {
-            let hqj = hq.col(j);
+            let hqj = &hq.col(j)[..n];
+            let xj = x[j];
             for i in 0..n {
-                y[i] += hqj[i] * x[j];
+                y[i] += hqj[i] * xj;
             }
         }
     }
@@ -343,14 +346,15 @@ pub(crate) fn calden_into(
         ..
     } = cw;
     // PRIMA: hdiag = -sum(zmat(:, 1:idz-1)**2, dim=2) + sum(zmat(:, idz:)**2, dim=2) —
-    // the negative part is empty for idz = 1.
-    for k in 0..npt {
-        let mut s = 0.0;
-        for j in 0..zmat.ncols() {
-            let z = zmat[[k, j]];
-            s += z * z;
+    // the negative part is empty for idz = 1. Column-outer interchange:
+    // contiguous ZMAT columns instead of stride-npt rows; every hdiag[k] still accumulates
+    // its z² terms in ascending j, so the sums are bit-identical to the row-outer form.
+    hdiag[..npt].fill(0.0);
+    for j in 0..zmat.ncols() {
+        let zj = &zmat.col(j)[..npt];
+        for k in 0..npt {
+            hdiag[k] += zj[k] * zj[k];
         }
-        hdiag[k] = s;
     }
     // Layer-0 spec §3-§5: PRIMA's calden calls calvlag AND calbeta, each recomputing the same
     // ≈15·n² H·w kernel on identical inputs. Here the kernel runs ONCE (into vlag_den, no `+1`),
@@ -371,8 +375,10 @@ pub(crate) fn calden_into(
 /// Layer-0 spec §5 (Tier A): VLAG **and** DEN from one ≈15·n² H·w kernel call, for the `bobyqb`
 /// sites that call `calvlag_into` then `calden_into` on the same `(kref, d, xpt, zmat, bmat)`.
 /// `vlag` (length npt + n) receives the `calvlag_lfqint` result (with the `+1` at `kref`); `den`
-/// (length npt) the `calden` result. Provenance: fuses `calvlag_lfqint` + `calden`; results are
-/// bit-identical to the two separate calls (one kernel; the `+1` is applied after the BETA read).
+/// (length npt) the `calden` result. Also returns BETA (the `calbeta` value the kernel derives
+/// on the way) so Tier B callers can thread it into `updateh` without a recompute.
+/// Provenance: fuses `calvlag_lfqint` + `calden`; results are bit-identical to the two separate
+/// calls (one kernel; the `+1` is applied after the BETA read).
 #[expect(clippy::too_many_arguments)] // scratch params mirror the hoisted Fortran locals
 pub(crate) fn calvlag_and_den_into(
     kref: usize,
@@ -383,7 +389,7 @@ pub(crate) fn calvlag_and_den_into(
     cw: &mut CalWs,
     vlag: &mut [f64],
     den: &mut [f64],
-) {
+) -> f64 {
     let n = xpt.nrows();
     let npt = xpt.ncols();
     let xref = xpt.col(kref);
@@ -396,14 +402,14 @@ pub(crate) fn calvlag_and_den_into(
         hdiag,
         ..
     } = cw;
-    // hdiag (idz = 1 specialization) — mirrors calden_into's hdiag; change together if the idz logic ever widens.
-    for k in 0..npt {
-        let mut s = 0.0;
-        for j in 0..zmat.ncols() {
-            let z = zmat[[k, j]];
-            s += z * z;
+    // hdiag (idz = 1 specialization) — mirrors calden_into's hdiag (incl. its column-outer
+    // interchange); change together if the idz logic ever widens.
+    hdiag[..npt].fill(0.0);
+    for j in 0..zmat.ncols() {
+        let zj = &zmat.col(j)[..npt];
+        for k in 0..npt {
+            hdiag[k] += zj[k] * zj[k];
         }
-        hdiag[k] = s;
     }
     // One kernel into the caller's `vlag` (no `+1` yet); BETA from it; then `+1`; then DEN.
     calvlag_noadd(
@@ -414,6 +420,7 @@ pub(crate) fn calvlag_and_den_into(
     for k in 0..npt {
         den[k] = hdiag[k] * beta + vlag[k] * vlag[k]; // == calden_into's output exactly.
     }
+    beta
 }
 
 #[cfg(test)]

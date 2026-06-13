@@ -1,6 +1,6 @@
 [package]
 name = "bobyqa"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.85"
 authors = ["Paweł Lenartowicz <pawellenartowicz@europe.com>"]
@@ -11,25 +11,34 @@ readme = "README.md"
 license = "MIT OR Apache-2.0"
 keywords = ["optimization", "bobyqa", "derivative-free", "minimization", "powell"]
 categories = ["mathematics", "science", "algorithms"]
-# The parity battery and its ~5 MB of frozen PRIMA trajectory/state dumps are a CI-only asset
-# ("freeze then forget", roadmap) — they live in git for CI but are not shipped to downstream users.
+# The parity battery and its ~5 MB of frozen PRIMA trajectory/state dumps are a CI-only asset —
+# they live in git for CI but are not shipped to downstream users.
 exclude = ["tests/"]
 
-# No dependencies and no dev-dependencies through M1 (design §4): the golden parser is
-# hand-rolled, and the bit-exact parity discipline never needed `approx`.
+# Zero runtime dependencies: the golden parser is hand-rolled, and the bit-exact parity
+# discipline never needed `approx`.
+
+# Dev-only: criterion drives benches/solver.rs, the warm-path per-call cost bench behind
+# every optimization adoption decision. Dev-dependencies never reach downstream users.
+[dev-dependencies]
+criterion = { version = "0.5", default-features = false }
+
+[[bench]]
+name = "solver"
+harness = false
 
 # `unsafe_code = "forbid"` deliberately lives in src/lib.rs (`#![forbid(unsafe_code)]`),
 # not here: [lints] applies to every target in the package, `forbid` cannot be
 # overridden by attributes, and tests/alloc.rs needs a dev-only
-# `unsafe impl GlobalAlloc` (design §8.2; rust.md §7).
+# `unsafe impl GlobalAlloc`.
 
 [features]
-# Dev-only kernel-invocation counter (Layer-0 spec §9 F0a). OFF by default: the shipped
-# library has no global mutable state (SPEC §1 aim 4). Mirrors tests/alloc.rs's dev-only shim.
+# Dev-only kernel-invocation counter. OFF by default: the shipped library has no global
+# mutable state. Mirrors tests/alloc.rs's dev-only shim.
 count-kernels = []
 
 [lints.rust]
-missing_docs = "deny" # M3: the public API is fully documented; an undocumented public item fails the build
+missing_docs = "deny" # the public API is fully documented; an undocumented public item fails the build
 
 [lints.clippy]
 all = { level = "deny", priority = 0 }

@@ -48,9 +48,12 @@ pub(crate) fn matprod21_into(x: &Mat, y: &[f64], z: &mut [f64]) {
     debug_assert_eq!(z.len(), x.nrows());
     z.fill(0.0);
     for j in 0..x.ncols() {
-        let xj = x.col(j);
+        // Length-equalized reslice: bounds-check-free inner loop; the lanes are
+        // independent accumulators, so vectorization cannot reorder any z[i]'s sum.
+        let xj = &x.col(j)[..z.len()];
+        let yj = y[j];
         for i in 0..z.len() {
-            z[i] += xj[i] * y[j];
+            z[i] += xj[i] * yj;
         }
     }
 }
@@ -71,9 +74,10 @@ pub(crate) fn matprod22_into(x: &Mat, y: &Mat, z: &mut Mat) {
     z.fill(0.0);
     for j in 0..y.ncols() {
         for i in 0..x.ncols() {
-            let xi = x.col(i);
             let yij = y[[i, j]];
             let zj = z.col_mut(j);
+            // Length-equalized reslice: see matprod21_into.
+            let xi = &x.col(i)[..zj.len()];
             for r in 0..zj.len() {
                 zj[r] += xi[r] * yij;
             }
@@ -94,9 +98,11 @@ pub(crate) fn matprod22(x: &Mat, y: &Mat) -> Mat {
 pub(crate) fn outprod_into(x: &[f64], y: &[f64], z: &mut Mat) {
     debug_assert_eq!((z.nrows(), z.ncols()), (x.len(), y.len()));
     for i in 0..y.len() {
-        let zi = z.col_mut(i);
+        let yi = y[i];
+        // Length-equalized reslice: see matprod21_into.
+        let zi = &mut z.col_mut(i)[..x.len()];
         for r in 0..x.len() {
-            zi[r] = x[r] * y[i];
+            zi[r] = x[r] * yi;
         }
     }
 }

@@ -63,6 +63,8 @@ impl UpdateWs {
 
 /// PRIMA update.f90 L22 `updateh`: update BMAT and ZMAT when XPT(:, KNEW) changes to XNEW.
 /// Returns `info`: `INFO_DFT` on success, `DAMAGING_ROUNDING` if the denominator was bad.
+#[expect(clippy::too_many_arguments)] // out-params mirror the Fortran intent (rust.md §5)
+#[expect(clippy::needless_range_loop)] // explicit indexed loops mirror PRIMA (rust.md §5)
 pub(crate) fn updateh(
     knew: Option<usize>,
     kopt: usize,
@@ -71,6 +73,7 @@ pub(crate) fn updateh(
     bmat: &mut Mat,
     zmat: &mut Mat,
     ws: &mut UpdateWs,
+    precomputed: Option<(&[f64], f64)>, // (vlag with +1, beta) from bobyqb this iteration; spec §5
 ) -> i32 {
     let n = xpt.nrows();
     let npt = xpt.ncols();
@@ -99,9 +102,18 @@ pub(crate) fn updateh(
     // PRIMA update.f90 L120: HCOL(NPT+1:NPT+N) = BMAT(:, KNEW).
     hcol[npt..npt + n].copy_from_slice(bmat.col(knew));
 
-    // PRIMA update.f90 L123-124: BETA and VLAG. kopt is already 0-based.
-    let beta = calbeta(kopt, bmat, d, xpt, zmat, cal);
-    calvlag_into(kopt, bmat, d, xpt, zmat, cal, vlag);
+    // PRIMA update.f90 L123-124: BETA and VLAG (kopt is already 0-based). Layer-0 spec §5
+    // (Tier B): reuse bobyqb's same-iteration values (kref = kopt, same d/xpt/zmat/bmat, no
+    // rescue since) by COPY — bit-identical, saves two kernels. Order in the recompute branch
+    // is calbeta THEN calvlag (PRIMA's order); the reuse branch is order-free (pure copy).
+    let beta = if let Some((vlag_src, beta_src)) = precomputed {
+        vlag.copy_from_slice(vlag_src);
+        beta_src
+    } else {
+        let beta = calbeta(kopt, bmat, d, xpt, zmat, cal);
+        calvlag_into(kopt, bmat, d, xpt, zmat, cal, vlag);
+        beta
+    };
 
     // PRIMA update.f90 L128-130: ALPHA, TAU, DENOM.
     let alpha = hcol[knew];
@@ -129,14 +141,22 @@ pub(crate) fn updateh(
     // PRIMA update.f90 L148: BMAT = BMAT + OUTPROD(V1, VLAG) + OUTPROD(V2, HCOL).
     // Two separate loops to preserve Fortran's left-to-right FP order:
     // first add OUTPROD(V1, VLAG), then add OUTPROD(V2, HCOL).
+    // Column-slice form: same i-ascending per-column adds, no per-element
+    // index arithmetic or bounds checks; the lanes are independent.
     for j in 0..(npt + n) {
+        let vj = vlag[j];
+        let bj = &mut bmat.col_mut(j)[..n];
+        let v1 = &v1[..n];
         for i in 0..n {
-            bmat[[i, j]] += v1[i] * vlag[j];
+            bj[i] += v1[i] * vj;
         }
     }
     for j in 0..(npt + n) {
+        let hj = hcol[j];
+        let bj = &mut bmat.col_mut(j)[..n];
+        let v2 = &v2[..n];
         for i in 0..n {
-            bmat[[i, j]] += v2[i] * hcol[j];
+            bj[i] += v2[i] * hj;
         }
     }
 
@@ -168,10 +188,12 @@ pub(crate) fn updateh(
             // PRIMA update.f90 L157-158: grot = planerot(zmat(knew, [1, j])).
             let grot = planerot([zmat[[knew, 0]], zmat[[knew, j]]]);
             // PRIMA update.f90 L158: ZMAT(:, [1, J]) = MATPROD(ZMAT(:, [1, J]), TRANSPOSE(GROT)).
+            // Two-column slice view — same rotation, same per-row FP ops.
+            let (z0, zj) = zmat.two_cols_mut(0, j);
             for i in 0..npt {
-                let (a, b) = (zmat[[i, 0]], zmat[[i, j]]);
-                zmat[[i, 0]] = a * grot[0][0] + b * grot[0][1];
-                zmat[[i, j]] = a * grot[1][0] + b * grot[1][1];
+                let (a, b) = (z0[i], zj[i]);
+                z0[i] = a * grot[0][0] + b * grot[0][1];
+                zj[i] = a * grot[1][0] + b * grot[1][1];
             }
         }
         // PRIMA update.f90 L160: ZMAT(KNEW, J) = ZERO — always, inside the J loop.
@@ -183,8 +205,14 @@ pub(crate) fn updateh(
     // at i == knew, so we must capture the unupdated value first.
     let sqrtdn = math::sqrt(denom);
     let zknew1 = zmat[[knew, 0]];
+    // The two quotients are loop-invariant (hoisting computes the identical
+    // values once); column-slice access for the rest.
+    let tau_q = tau / sqrtdn;
+    let zk_q = zknew1 / sqrtdn;
+    let z0 = &mut zmat.col_mut(0)[..npt];
+    let vl = &vlag[..npt];
     for i in 0..npt {
-        zmat[[i, 0]] = (tau / sqrtdn) * zmat[[i, 0]] - (zknew1 / sqrtdn) * vlag[i];
+        z0[i] = tau_q * z0[i] - zk_q * vl[i];
     }
 
     INFO_DFT
@@ -418,7 +446,7 @@ mod tests {
             // No `info` diff: the bobyqb.f90 call site on this pin omits the optional INFO
             // (oracle/README.md, Instrumentation).
             let mut ws = UpdateWs::new(xpt.nrows(), xpt.ncols());
-            let _info = updateh(knew, kopt, &d, &xpt, &mut bmat, &mut zmat, &mut ws);
+            let _info = updateh(knew, kopt, &d, &xpt, &mut bmat, &mut zmat, &mut ws, None);
             stats.mat("bmat", &bmat, &x.mat("bmat"));
             stats.mat("zmat", &zmat, &x.mat("zmat"));
         }
@@ -536,7 +564,7 @@ mod tests {
         let mut zmat = Mat::from_col_major(4, 2, (0..8).map(f64::from).collect());
         let (b0, z0) = (bmat.data().to_vec(), zmat.data().to_vec());
         let mut ws = UpdateWs::new(xpt.nrows(), xpt.ncols());
-        let info = updateh(None, 0, &[0.0], &xpt, &mut bmat, &mut zmat, &mut ws);
+        let info = updateh(None, 0, &[0.0], &xpt, &mut bmat, &mut zmat, &mut ws, None);
         assert_eq!(info, crate::consts::INFO_DFT);
         assert_eq!(bmat.data(), &b0[..]);
         assert_eq!(zmat.data(), &z0[..]);

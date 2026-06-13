@@ -727,7 +727,11 @@ pub(crate) fn bobyqb<F: FnMut(&[f64]) -> f64>(
             // PRIMA bobyqb.f90 L395-397: VLAG and DEN, then call RESCUE if rounding has damaged the
             // denominator. One kernel, not two (calvlag_into + calden_into recompute the same H·w)
             // — bit-identical.
-            calvlag_and_den_into(kopt, bmat, d, xpt, zmat, cal, vlag, den);
+            let ref_beta = calvlag_and_den_into(kopt, bmat, d, xpt, zmat, cal, vlag, den);
+            // Layer-0 spec §5 (Tier B): the vlag/den/ref_beta just computed are reusable by
+            // setdrop_tr/updateh below ONLY while (kopt, d, xpt, zmat, bmat) stay unchanged. The
+            // rescue branch (below) invalidates them; this flag is cleared there if rescue runs.
+            let mut model_unchanged = true;
             let vlag_abs_sum: f64 = vlag.iter().map(|v| math::abs(*v)).sum();
             // PRIMA L397: VMAX = MAXVAL(VLAG(1:NPT)**2) — ascending max over the first NPT entries.
             // The 0.0 is dead: npt >= 1, so the k == 0 arm below always overwrites it. It only
@@ -756,6 +760,7 @@ pub(crate) fn bobyqb<F: FnMut(&[f64]) -> f64>(
                     break;
                 }
                 rescued = true;
+                model_unchanged = false; // rescue moved XBASE/kopt/xpt/bmat/zmat and recomputed D
                 dnorm_rec = [REALMAX; 2];
                 moderr_rec = [REALMAX; 2];
 
@@ -769,13 +774,33 @@ pub(crate) fn bobyqb<F: FnMut(&[f64]) -> f64>(
             }
 
             // PRIMA bobyqb.f90 L429: index of the point to replace with XOPT + D.
-            knew_tr = setdrop_tr(kopt, ximproved, bmat, d, delta, rho, xpt, zmat, gws);
+            knew_tr = setdrop_tr(
+                kopt,
+                ximproved,
+                bmat,
+                d,
+                delta,
+                rho,
+                xpt,
+                zmat,
+                gws,
+                model_unchanged.then_some(den.as_slice()),
+            );
 
             // PRIMA bobyqb.f90 L435-448: update [BMAT, ZMAT], [GOPT, HQ, PQ], [FVAL, XPT, KOPT].
             if let Some(knew) = knew_tr {
                 xdrop.copy_from_slice(xpt.col(knew));
                 xosav.copy_from_slice(xpt.col(kopt));
-                let _ = updateh(Some(knew), kopt, d, xpt, bmat, zmat, uws);
+                let _ = updateh(
+                    Some(knew),
+                    kopt,
+                    d,
+                    xpt,
+                    bmat,
+                    zmat,
+                    uws,
+                    model_unchanged.then_some((vlag.as_slice(), ref_beta)),
+                );
                 for i in 0..n {
                     xnew_clamped[i] = sl[i].max(su[i].min(xosav[i] + d[i]));
                 }
@@ -919,7 +944,7 @@ pub(crate) fn bobyqb<F: FnMut(&[f64]) -> f64>(
                 // PRIMA bobyqb.f90 L598-606: update [BMAT, ZMAT], [FVAL, XPT, KOPT], [GOPT, HQ, PQ].
                 xdrop.copy_from_slice(xpt.col(knew_geo));
                 xosav.copy_from_slice(xpt.col(kopt));
-                let _ = updateh(Some(knew_geo), kopt, d, xpt, bmat, zmat, uws);
+                let _ = updateh(Some(knew_geo), kopt, d, xpt, bmat, zmat, uws, None);
                 for i in 0..n {
                     xnew_clamped[i] = sl[i].max(su[i].min(xosav[i] + d[i]));
                 }

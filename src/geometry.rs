@@ -119,6 +119,7 @@ pub(crate) fn setdrop_tr(
     xpt: &Mat,
     zmat: &Mat,
     ws: &mut GeostepWs,
+    den_precomputed: Option<&[f64]>,
 ) -> Option<usize> {
     let n = xpt.nrows();
     let npt = xpt.ncols();
@@ -165,8 +166,15 @@ pub(crate) fn setdrop_tr(
         weight[k] = m2 * m2;
     }
 
-    // PRIMA geometry.f90 L134–143: den = calden; score = weight * den
-    calden_into(kopt, bmat, d, xpt, zmat, cal, den);
+    // PRIMA geometry.f90 L134: den = calden. Layer-0 spec §5 (Tier B): when bobyqb already
+    // computed this exact DEN for (kopt, d, xpt, zmat, bmat) this iteration and no rescue has
+    // run since, reuse it by COPY (spec §4: buffer copy, never algebraic adjustment) — saves one
+    // ≈15·n² kernel, bit-identically.
+    match den_precomputed {
+        Some(src) => den.copy_from_slice(src),
+        None => calden_into(kopt, bmat, d, xpt, zmat, cal, den),
+    }
+    // PRIMA geometry.f90 L143: score = weight * den
     for k in 0..npt {
         score[k] = weight[k] * den[k];
     }
@@ -321,9 +329,11 @@ pub(crate) fn geostep(
     // PRIMA geometry.f90 L338: distsq = sum((xpt - spread(xopt, dim=2, ncopies=npt))**2, dim=1)
     distsq.fill(0.0);
     for k in 0..npt {
+        // Column-slice access: same i-ascending accumulation per k.
+        let xk = &xpt.col(k)[..n];
         let mut sq = 0.0;
         for i in 0..n {
-            let diff = xpt[[i, k]] - xopt[i];
+            let diff = xk[i] - xopt[i];
             sq += diff * diff;
         }
         distsq[k] = sq;
@@ -356,8 +366,10 @@ pub(crate) fn geostep(
         xdiff.fill(0.0);
         lfrac.fill(0.0);
         ufrac.fill(0.0);
+        // Column-slice access — same per-element ops in the same order.
+        let xk = &xpt.col(k)[..n];
         for i in 0..n {
-            xdiff[i] = xpt[[i, k]] - xopt[i];
+            xdiff[i] = xk[i] - xopt[i];
             // PRIMA: lfrac = sign(subd, -xdiff) — initialize to sign(subd, -xdiff[i])
             lfrac[i] = subd_init.copysign(-xdiff[i]);
             // PRIMA where (sl - xopt > -abs(xdiff) * subd) lfrac = (sl - xopt) / xdiff
@@ -777,6 +789,7 @@ mod tests {
                 &xpt,
                 &e.mat("zmat"),
                 &mut ws,
+                None,
             );
             assert_eq!(
                 knew.map_or(0, |k| k + 1),
@@ -858,7 +871,9 @@ mod tests {
 
         for kopt in 0..npt {
             let mut ws = GeostepWs::new(n, npt);
-            let knew = setdrop_tr(kopt, false, &bmat, &d, delta, rho, &xpt, &zmat, &mut ws);
+            let knew = setdrop_tr(
+                kopt, false, &bmat, &d, delta, rho, &xpt, &zmat, &mut ws, None,
+            );
             assert!(
                 knew != Some(kopt),
                 "setdrop_tr with ximproved=false returned kopt={kopt}"
@@ -880,7 +895,18 @@ mod tests {
         let zmat = Mat::zeros(npt, npt - n - 1);
         let xpt = Mat::zeros(n, npt);
         let mut ws = GeostepWs::new(n, npt);
-        let knew = setdrop_tr(kopt, false, &bmat, &[1.0], 1.0, 1.0, &xpt, &zmat, &mut ws);
+        let knew = setdrop_tr(
+            kopt,
+            false,
+            &bmat,
+            &[1.0],
+            1.0,
+            1.0,
+            &xpt,
+            &zmat,
+            &mut ws,
+            None,
+        );
         assert_eq!(knew, None);
     }
 

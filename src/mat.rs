@@ -45,6 +45,15 @@ impl Mat {
         self.data.fill(v);
     }
 
+    /// Disjoint mutable views of columns `a` and `b`, `a < b` — the two-column Givens-rotation
+    /// update in `updateh` (slice access instead of per-element `[[i, j]]`).
+    pub(crate) fn two_cols_mut(&mut self, a: usize, b: usize) -> (&mut [f64], &mut [f64]) {
+        debug_assert!(a < b, "two_cols_mut needs a < b");
+        let nr = self.nrows;
+        let (lo, hi) = self.data.split_at_mut(b * nr);
+        (&mut lo[a * nr..(a + 1) * nr], &mut hi[..nr])
+    }
+
     /// Overwrites `self` with `src` (same shape) — workspace refill for the M2 reuse design.
     pub(crate) fn copy_from(&mut self, src: &Mat) {
         debug_assert_eq!(self.nrows, src.nrows, "copy_from: row mismatch");
