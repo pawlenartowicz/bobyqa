@@ -7,6 +7,7 @@ name: CI
 on:
   push:
   pull_request:
+  workflow_call: # release.yml gates publishing on this suite
 
 env:
   CARGO_TERM_COLOR: always

@@ -5,6 +5,16 @@ All notable changes to this crate are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.3] — 2026-07-02
+
+No behaviour or API change — housekeeping release.
+
+### Changed
+
+- Formatted the 0.1.2 test additions with `rustfmt` (CI's `cargo fmt --check` was red).
+- Publishing on a version tag now runs the full CI suite as a required job — a tag
+  whose commit fails any gate never reaches crates.io.
+
 ## [0.1.2] — 2026-07-02
 
 No behaviour change — `(x, f)` trajectories remain bit-exact against the PRIMA

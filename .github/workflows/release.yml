@@ -1,8 +1,8 @@
 # Publish to crates.io on a version tag (v0.1.1, v0.2.0, ...).
 #
 # Auth: the CARGO_REGISTRY_TOKEN repository secret (crates.io API token).
-# CI correctness gates already run on every push, including the tag push —
-# this job only checks tag/Cargo.toml agreement and publishes.
+# The full CI suite runs here as a required job — publish is blocked
+# unless every gate passes on the tagged commit.
 name: Release
 
 on:
@@ -11,7 +11,11 @@ on:
       - "v*"
 
 jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
   publish:
+    needs: ci
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6

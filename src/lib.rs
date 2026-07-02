@@ -587,14 +587,31 @@ mod tests {
         // contract documented on `FUNCMAX` / `Outcome::f`.
         let (n, c) = valid();
         let mut s = Bobyqa::new(n, c).unwrap();
-        let o = s.minimize(|_: &[f64]| f64::INFINITY, &mut [1.0, 2.0], &[-5.0, -5.0], &[5.0, 5.0]);
+        let o = s.minimize(
+            |_: &[f64]| f64::INFINITY,
+            &mut [1.0, 2.0],
+            &[-5.0, -5.0],
+            &[5.0, 5.0],
+        );
         assert_eq!(o.status, Status::Converged); // faithful PRIMA: flat moderated surface
-        assert!(o.f >= FUNCMAX, "degenerate exit must be detectable: f = {} < FUNCMAX", o.f);
-        assert!(!o.found_finite(), "all-infeasible run must report found_finite() == false");
+        assert!(
+            o.f >= FUNCMAX,
+            "degenerate exit must be detectable: f = {} < FUNCMAX",
+            o.f
+        );
+        assert!(
+            !o.found_finite(),
+            "all-infeasible run must report found_finite() == false"
+        );
 
         // A normal fit finds finite values → found_finite() == true.
         let mut s = Bobyqa::new(n, c).unwrap();
-        let good = s.minimize(|p: &[f64]| p.iter().map(|v| v * v).sum::<f64>(), &mut [1.0, 2.0], &[-5.0, -5.0], &[5.0, 5.0]);
+        let good = s.minimize(
+            |p: &[f64]| p.iter().map(|v| v * v).sum::<f64>(),
+            &mut [1.0, 2.0],
+            &[-5.0, -5.0],
+            &[5.0, 5.0],
+        );
         assert!(good.found_finite());
     }
 
