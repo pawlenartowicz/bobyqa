@@ -104,16 +104,48 @@ impl core::fmt::Display for Status {
 
 impl std::error::Error for Status {}
 
+/// PRIMA's moderated-extreme-barrier ceiling (`consts.F90` L169, `10^min(30, range/2)`
+/// = `1e30` for `f64`). Every objective value is passed through PRIMA's `moderatef`
+/// before the solver uses it: `NaN` and `+inf` become `FUNCMAX`, and any finite value
+/// above it is clamped to it. This is what lets BOBYQA keep making progress past an
+/// occasional non-finite evaluation.
+///
+/// Consequence for callers: a returned [`Outcome::f`] `>= FUNCMAX` means the solver
+/// **never found a genuinely finite objective value** — every point it evaluated was
+/// `NaN`/`+inf` or beyond the ceiling. When the whole initial interpolation set is
+/// infeasible this flat, moderated surface still terminates as [`Status::Converged`]
+/// (a faithful PRIMA `SMALL_TR_RADIUS` exit on a flat model), so `status` alone does
+/// not distinguish it — test `outcome.f >= FUNCMAX` to detect a degenerate fit that
+/// never left an infeasible region.
+pub const FUNCMAX: f64 = consts::FUNCMAX;
+
 /// The result of one [`Bobyqa::minimize`] call.
 #[derive(Debug, Clone, Copy)]
 pub struct Outcome {
-    /// Best objective value found. NaN when `status` is [`Status::InvalidArgs`] —
-    /// nothing was evaluated.
+    /// Best objective value found. `NaN` when `status` is [`Status::InvalidArgs`] —
+    /// nothing was evaluated. A value `>= `[`FUNCMAX`] means every evaluated point was
+    /// non-finite (see [`FUNCMAX`]): the run is degenerate even if `status` is
+    /// [`Status::Converged`].
     pub f: f64,
     /// Objective evaluations consumed.
     pub n_eval: usize,
     /// Why the solver stopped.
     pub status: Status,
+}
+
+impl Outcome {
+    /// Whether the solver ever evaluated a genuinely finite objective value.
+    ///
+    /// `false` means every point it tried was `NaN`/`+inf` (each moderated to
+    /// [`FUNCMAX`]) — a degenerate run, even when [`status`](Self::status) is
+    /// [`Status::Converged`] (a flat moderated surface exits faithfully as PRIMA's
+    /// `SMALL_TR_RADIUS`). Equivalent to `self.f < FUNCMAX`; prefer this at call
+    /// sites for intent. `NaN` `f` (the [`Status::InvalidArgs`] no-evaluation case)
+    /// is also reported as not-finite.
+    #[must_use]
+    pub fn found_finite(&self) -> bool {
+        self.f < FUNCMAX
+    }
 }
 
 /// A reusable BOBYQA solver: holds every buffer the algorithm needs, built
@@ -544,6 +576,26 @@ mod tests {
         let o = s.minimize(sphere, &mut [1.0, 2.0], &[-5.0, -5.0], &[5.0, 5.0]);
         assert_eq!(o.status, Status::MaxFunReached);
         assert_eq!(o.n_eval, 6);
+    }
+
+    #[test]
+    fn all_infeasible_objective_is_detectable_via_funcmax_despite_converged() {
+        // An objective that is +inf everywhere: `moderatef` maps every evaluation to
+        // FUNCMAX, so the interpolation set is a flat, finite surface and BOBYQA exits
+        // faithfully as Converged (SMALL_TR_RADIUS on a flat model). The public FUNCMAX
+        // const is how a caller distinguishes this degenerate run from a real one — the
+        // contract documented on `FUNCMAX` / `Outcome::f`.
+        let (n, c) = valid();
+        let mut s = Bobyqa::new(n, c).unwrap();
+        let o = s.minimize(|_: &[f64]| f64::INFINITY, &mut [1.0, 2.0], &[-5.0, -5.0], &[5.0, 5.0]);
+        assert_eq!(o.status, Status::Converged); // faithful PRIMA: flat moderated surface
+        assert!(o.f >= FUNCMAX, "degenerate exit must be detectable: f = {} < FUNCMAX", o.f);
+        assert!(!o.found_finite(), "all-infeasible run must report found_finite() == false");
+
+        // A normal fit finds finite values → found_finite() == true.
+        let mut s = Bobyqa::new(n, c).unwrap();
+        let good = s.minimize(|p: &[f64]| p.iter().map(|v| v * v).sum::<f64>(), &mut [1.0, 2.0], &[-5.0, -5.0], &[5.0, 5.0]);
+        assert!(good.found_finite());
     }
 
     #[test]
