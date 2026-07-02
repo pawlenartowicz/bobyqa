@@ -6,6 +6,7 @@ name: CI
 
 on:
   push:
+    branches: ["**"] # branches only — on a tag push, release.yml runs this via workflow_call
   pull_request:
   workflow_call: # release.yml gates publishing on this suite
 
