@@ -5,6 +5,55 @@ All notable changes to this crate are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] — 2026-07-31
+
+With `restart: None` — the default — `Bobyqa` is unchanged by this release: its trust-region
+core, allocation shape, and `(x, f)` trajectories remain bit-exact, and the existing PRIMA
+golden-trajectory battery still passes bit-exact.
+
+### Added
+
+- **Restarts**, on `Bobyqa` itself via the new `Config::restart: Option<RestartConfig>`
+  field (default `None`: plain BOBYQA). Rather than stopping, a solve can start a new cycle:
+  `rho`/`delta` go back to `rho_begin` and the interpolation set is rebuilt from scratch
+  around the best point found so far. Discarding the model rather than re-widening it is
+  what lets a new cycle leave the basin the previous one converged in. The returned point is
+  the best over every cycle, so a restart never returns something worse than stopping would
+  have. `Config::max_fun` is the TOTAL evaluation budget across every cycle, not just the
+  opening solve.
+- **Three triggers**, all on `RestartConfig`, all gated by `max_restarts` (default 1) and by
+  a relative-improvement settle test (`improve_rel_tol`, default `1e-6`):
+  - `cycle_budget_frac` (default `0.125`) — the eval cap and the recommended trigger:
+    restart once the cycle has spent that fraction of the budget that remained when it
+    started. Consulted at every trust-region iteration, so it fires on a cycle that is
+    crawling without reducing `rho`. `0.0` disables it.
+  - `rho_end` — reaching the target radius. **With the cap set this trigger defers to it:**
+    reaching `rho_end` restarts only when the cap agrees the cycle was expensive, so a solve
+    that converges well inside its cap returns exactly what `restart: None` returns,
+    evaluation count included. With the cap off it restarts on the settle test alone.
+  - `stall_reductions` (default `0`: off) — restart before `rho_end` after that many
+    consecutive `rho` reductions each improving the best value by less than
+    `improve_rel_tol` relative to `max(1, |f|)`, cutting a stalled `rho` tail.
+
+  Whichever trigger fires, the final cycle — once no restart remains — always runs down to
+  `rho_end`, so the returned point is never coarser than a plain solve's.
+- `Bobyqa::last_restart_count()` — restarts performed by the last `minimize` call — and
+  `Bobyqa::last_cycle_boundaries()` — the cumulative evaluation count at each restart
+  boundary, for per-cycle costs. Both are allocation-free at `minimize` time (the boundary
+  store is sized at construction).
+- With restarts enabled, `Status::Converged` also covers a settled restart schedule: it is
+  returned both when a single `rho_end` convergence is reached and when a restart schedule
+  stops because a cycle failed the `improve_rel_tol` settle test, `max_restarts` was
+  reached, or a later cycle could not continue. Either way, the returned point is always
+  the best one evaluated across all cycles.
+
+### Changed
+
+- **Breaking:** `Config` and `RestartConfig` are now `#[non_exhaustive]`. Struct literals
+  and struct-update syntax (`..Config::new(n)`) no longer compile outside the crate — build
+  with `Config::new(n)` / `RestartConfig::new()` and assign fields to override. Taken in one
+  bump so future knobs (both structs are expected to grow) land as non-breaking additions.
+
 ## [0.1.3] — 2026-07-02
 
 No behaviour or API change — housekeeping release.
@@ -63,6 +112,8 @@ Initial release.
   only); deterministic — no RNG, global state, threads, or I/O; invalid
   arguments are returned as a `Status`, never panicked.
 
+[0.2.0]: https://github.com/pawlenartowicz/bobyqa/releases/tag/v0.2.0
+[0.1.3]: https://github.com/pawlenartowicz/bobyqa/releases/tag/v0.1.3
 [0.1.2]: https://github.com/pawlenartowicz/bobyqa/releases/tag/v0.1.2
 [0.1.1]: https://github.com/pawlenartowicz/bobyqa/releases/tag/v0.1.1
 [0.1.0]: https://github.com/pawlenartowicz/bobyqa/releases/tag/v0.1.0

@@ -9,7 +9,8 @@
 //! public `Status` in `lib.rs`.
 
 use crate::consts::{
-    DAMAGING_ROUNDING, INFO_DFT, MAXTR_REACHED, NAN_INF_MODEL, REALMAX, SMALL_TR_RADIUS,
+    DAMAGING_ROUNDING, INFO_DFT, MAXTR_REACHED, NAN_INF_F, NAN_INF_MODEL, NAN_INF_X, REALMAX,
+    SMALL_TR_RADIUS,
 };
 use crate::geometry::{GeostepWs, geostep, setdrop_tr};
 use crate::initialize::{InitWs, inith, initq, initxf};
@@ -134,9 +135,106 @@ pub(crate) struct BobyqbWs {
     xnew_clamped: Vec<f64>,  // n
     fval_shift: Vec<f64>,    // npt
     xopt_copy: Vec<f64>,     // n
+    best_x: Vec<f64>,        // n — D3's monotone incumbent record (hard-restart spec §5)
     cal: CalWs,
     shiftbase: ShiftbaseWs,
     errbd: ErrbdWs,
+}
+
+/// State threaded into `bobyqb` when restarts are enabled (`Config::restart` is `Some`).
+pub(crate) struct RestartState {
+    pub(crate) config: crate::RestartConfig,
+    pub(crate) restarts_done: usize,
+    /// Best `fopt` at the end of the previous restart cycle (`None` for the opening solve),
+    /// used by the settle test in `should_restart`.
+    pub(crate) last_fopt: Option<f64>,
+    /// Consecutive `rho` reductions whose `fopt` improvement stayed below `improve_rel_tol`
+    /// (stall-restart spec §4). Reset by any productive reduction and by every restart.
+    pub(crate) stall_count: usize,
+    /// `fopt` at the previous `rho` reduction — the stall counter's comparison baseline
+    /// (`None` before the solve's first reduction; reset to the `fopt` in hand at each restart
+    /// so no cycle starts with a strike carried over).
+    pub(crate) stall_fopt: Option<f64>,
+    /// Cumulative `nf` at the current cycle's start (0 for the opening solve) — the eval-cap
+    /// trigger's baseline: both the cycle's spend and its allowance are measured from here
+    /// (hard-restart spec §4: the allowance is a fraction of the budget *remaining* at the
+    /// cycle's start, so successive cut points are geometric).
+    pub(crate) nf_cycle_start: usize,
+    /// Cumulative `nf` at each restart boundary, so a caller can diff it into per-cycle
+    /// evaluation counts. Owned by `Bobyqa` (sized `max_restarts + 1` at construction, the
+    /// crate's sole allocation site) and lent here by `mem::take`, so pushes — at most one per
+    /// restart — stay within capacity and the warm path stays zero-alloc.
+    pub(crate) cycle_boundaries: Vec<usize>,
+}
+
+impl RestartState {
+    /// Settle test + backstops. Restart iff a restart remains, budget remains, and the last
+    /// completed cycle improved `fopt` by at least `improve_rel_tol` relative to `max(1, |fopt|)`.
+    /// The opening solve (no prior cycle) always passes the improvement test.
+    fn should_restart(&self, fopt: f64, nf: usize, maxfun: usize) -> bool {
+        if self.restarts_done >= self.config.max_restarts {
+            return false;
+        }
+        if nf >= maxfun {
+            return false;
+        }
+        match self.last_fopt {
+            None => true, // opening solve reached rho_end; try the first restart
+            Some(prev) => {
+                let improved = prev - fopt; // fopt <= prev (monotone incumbent)
+                improved >= self.config.improve_rel_tol * fopt.abs().max(1.0)
+            }
+        }
+    }
+
+    /// The stall trigger's bookkeeping, called at every `rho` reduction short of `rho_end`
+    /// (stall-restart spec §4): a reduction improving `fopt` by less than `improve_rel_tol`
+    /// relative to `max(1, |fopt|)` is a strike, any other resets the counter. Returns whether
+    /// the strike count has reached `stall_reductions` — `should_restart` still gates the
+    /// actual restart (spec D4: with no restart remaining the stall trigger is inert).
+    fn note_reduction(&mut self, fopt: f64) -> bool {
+        if self.config.stall_reductions == 0 {
+            return false; // early trigger disabled: the rho_end-only schedule
+        }
+        match self.stall_fopt {
+            None => self.stall_count = 0, // the solve's first reduction has no baseline
+            Some(prev) => {
+                let improved = prev - fopt; // fopt <= prev (monotone incumbent)
+                if improved >= self.config.improve_rel_tol * fopt.abs().max(1.0) {
+                    self.stall_count = 0;
+                } else {
+                    self.stall_count += 1;
+                }
+            }
+        }
+        self.stall_fopt = Some(fopt);
+        self.stall_count >= self.config.stall_reductions
+    }
+
+    /// The eval-cap trigger's test (hard-restart spec §7.1's fallback, §4's per-cycle budget):
+    /// the cycle has spent at least `cycle_budget_frac` of the evaluations that remained at
+    /// its start. `0.0` disables. Purely the trigger — `should_restart` still gates the
+    /// actual restart, exactly as it gates the stall trigger.
+    fn over_cycle_budget(&self, nf: usize, maxfun: usize) -> bool {
+        let frac = self.config.cycle_budget_frac;
+        #[expect(clippy::cast_precision_loss)] // budgets are far below 2^52
+        {
+            frac > 0.0
+                && (nf - self.nf_cycle_start) as f64
+                    >= frac * ((maxfun - self.nf_cycle_start) as f64)
+        }
+    }
+
+    /// Record the cycle's best, count the restart, and reset the stall state (spec §4: counter
+    /// to 0, baseline to the `fopt` in hand — no strike carries into the new cycle).
+    fn on_restart(&mut self, fopt: f64, nf: usize) {
+        self.last_fopt = Some(fopt);
+        self.restarts_done += 1;
+        self.stall_count = 0;
+        self.stall_fopt = Some(fopt);
+        self.nf_cycle_start = nf;
+        self.cycle_boundaries.push(nf);
+    }
 }
 
 /// All solver scratch, allocated once in `Bobyqa::new` and reused across `minimize` calls —
@@ -183,6 +281,7 @@ impl SolverWs {
                 xnew_clamped: vec![0.0; n],
                 fval_shift: vec![0.0; npt],
                 xopt_copy: vec![0.0; n],
+                best_x: vec![0.0; n],
                 cal: CalWs::new(n, npt),
                 shiftbase: ShiftbaseWs::new(n, npt),
                 errbd: ErrbdWs::new(n, npt),
@@ -479,6 +578,126 @@ fn errbd(
     ebound
 }
 
+/// The hard-restart body (hard-restart spec §5): discard the quadratic model and rebuild it
+/// from the incumbent at `rho_begin`, on the existing workspace.
+///
+/// Reachable only from the restart hook, so `Bobyqa` (`restart == None`) never runs a line of
+/// it and stays bit-exact. Allocation-free: `initxf`/`initq`/`inith` re-initialize every
+/// output in place, so the opening three-call sequence is re-entrant as written.
+///
+/// Order of business (each step spec §5's):
+/// 1. Save the incumbent into the monotone best record (D3) — the seed revision below can
+///    move the rebuild off it, and every rebuilt point may be worse.
+/// 2. Seed `x` with the incumbent and apply the same bound-distance revision `prepare_call`
+///    applies to a fresh start point (distance to each inactive bound forced to 0 or
+///    `>= rho_begin`). Not optional: `initxf`'s `sl[i].min(-rhobeg)` guard is an identity
+///    only for a revised x0, and a converged incumbent is expected to sit within `rho_begin`
+///    of a bound — on an unrevised seed the model records a displacement the objective was
+///    never evaluated at (bounds themselves are safe regardless; `xinbd_into` clamps).
+/// 3. Re-run `initxf` → `inith` → `initq` from that seed. One accounting seam: `initxf`
+///    counts from 1, so it gets `maxfun - nf` as its budget and the returned count is added
+///    to the cumulative `nf` — otherwise a rebuild could spend the whole `max_fun` again.
+///
+/// Returns the `info` the caller must stop with, or [`INFO_DFT`] to continue the main loop
+/// from the rebuilt model. `kopt`/`nf`/`f`/`x` end exactly as the opening sequence leaves
+/// them; an `initxf` breakdown (`f_target` hit, budget exhausted, NaN objective) is reported
+/// exactly as the opening call's is.
+#[expect(clippy::too_many_arguments)] // the loop state threaded in mirrors bobyqb's own locals
+fn hard_rebuild<F: FnMut(&[f64]) -> f64>(
+    calfun: &mut F,
+    maxfun: usize,
+    ftarget: f64,
+    rhobeg: f64,
+    kopt: &mut usize,
+    nf: &mut usize,
+    f: &mut f64,
+    best_f: &mut f64,
+    x: &mut [f64],
+    xl: &[f64],
+    xu: &[f64],
+    sl: &mut [f64],
+    su: &mut [f64],
+    xbase: &mut [f64],
+    bmat: &mut Mat,
+    zmat: &mut Mat,
+    xpt: &mut Mat,
+    fval: &mut [f64],
+    gopt: &mut [f64],
+    hq: &mut Mat,
+    pq: &mut [f64],
+    ij: &mut Vec<(usize, usize)>,
+    best_x: &mut [f64],
+    iws: &mut InitWs,
+) -> i32 {
+    let n = xpt.nrows();
+
+    // D3: fold the incumbent into the record before the rebuild can lose it. The record is
+    // non-increasing across rebuilds by construction (min of itself and the incumbent); the
+    // assertion pins that against future edits.
+    let prev_best = *best_f;
+    if fval[*kopt] < *best_f {
+        *best_f = fval[*kopt];
+        xinbd_into(xbase, xpt.col(*kopt), xl, xu, sl, su, best_x);
+    }
+    debug_assert!(
+        *best_f <= prev_best,
+        "D3: the best record must be non-increasing"
+    );
+
+    // Step 2: the incumbent in original coordinates, then preproc.f90 L341-350's revision
+    // (HONOUR_X0 = FALSE), transcribed from `prepare_call` — the hook is inside `bobyqb`,
+    // so the seed does not pass through `prepare_call` on its own.
+    xinbd_into(xbase, xpt.col(*kopt), xl, xu, sl, su, x);
+    for i in 0..n {
+        if x[i] <= xl[i] + 0.5 * rhobeg {
+            x[i] = xl[i];
+        } else if x[i] < xl[i] + rhobeg {
+            x[i] = xl[i] + rhobeg;
+        }
+    }
+    for i in 0..n {
+        if x[i] >= xu[i] - 0.5 * rhobeg {
+            x[i] = xu[i];
+        } else if x[i] > xu[i] - rhobeg {
+            x[i] = xu[i] - rhobeg;
+        }
+    }
+
+    // Step 3: the opening sequence, on the remaining budget.
+    let (kopt_new, nf_init, mut subinfo) = initxf(
+        calfun,
+        maxfun - *nf,
+        ftarget,
+        rhobeg,
+        xl,
+        xu,
+        x,
+        ij,
+        fval,
+        sl,
+        su,
+        xbase,
+        xpt,
+        iws,
+    );
+    *kopt = kopt_new;
+    *nf += nf_init;
+    xinbd_into(xbase, xpt.col(*kopt), xl, xu, sl, su, x);
+    *f = fval[*kopt];
+    if subinfo == INFO_DFT {
+        let _ = inith(ij, xpt, bmat, zmat, iws);
+        let _ = initq(ij, fval, xpt, gopt, hq, pq, iws);
+        // PRIMA L246: literal NaN-bearing negation of the model-finiteness test.
+        if !(gopt.iter().all(|v| v.is_finite())
+            && hq.data().iter().all(|v| v.is_finite())
+            && pq.iter().all(|v| v.is_finite()))
+        {
+            subinfo = NAN_INF_MODEL;
+        }
+    }
+    subinfo
+}
+
 /// PRIMA bobyqb.f90 L46 `bobyqb`: the major calculations of BOBYQA. Returns `(f, nf, info)`;
 /// `x` is overwritten with the best point (in original coordinates).
 ///
@@ -506,6 +725,7 @@ pub(crate) fn bobyqb<F: FnMut(&[f64]) -> f64>(
     rhoend: f64,
     x: &mut [f64],
     ws: &mut SolverWs,
+    mut restart: Option<&mut RestartState>,
 ) -> (f64, usize, i32) {
     let n = x.len();
 
@@ -546,6 +766,7 @@ pub(crate) fn bobyqb<F: FnMut(&[f64]) -> f64>(
         xnew_clamped,
         fval_shift,
         xopt_copy,
+        best_x,
         cal,
         shiftbase: sbws,
         errbd: ebws,
@@ -631,14 +852,116 @@ pub(crate) fn bobyqb<F: FnMut(&[f64]) -> f64>(
     // PRIMA bobyqb.f90 L315-316: MAXTR is the maximal number of trust-region iterations. Deliberate
     // divergence from the Fortran's HUGE(MAXTR) - 1 (budget-class; near-unreachable):
     // each TR iteration consumes 1-2 evaluations unless SHORTD/TRFAIL with no geometry step.
-    let maxtr = maxfun.saturating_mul(2);
+    //
+    // Restart extension: the loop below runs across every restart cycle (the
+    // restart hook `continue`s it rather than returning), so this budget must absorb a
+    // worst-case zero-eval iteration burst (SHORTD/TRFAIL, no geometry step) once per cycle,
+    // not just once for a whole solve. CONFIRMED necessary, not precautionary: an ad hoc sweep
+    // (n in {2,4,8,16}, max_restarts up to 1000, quantized/staircase/Rosenbrock objectives,
+    // improve_rel_tol = 0 to keep every cycle firing) hit MAXTR_REACHED under the unscaled
+    // `maxfun * 2` formula in several cases (e.g. n=2, max_restarts=100..200, max_fun=400 —
+    // cut off at 90-112 restarts with nf far below the budget); scaling by `max_restarts + 1`
+    // (opening solve + every restart cycle) eliminated every occurrence over the same sweep.
+    // Restart path only — `restart == None` (`Bobyqa`) keeps the exact original formula, so the
+    // restart-off surface stays bit-exact.
+    let maxtr = match restart.as_deref() {
+        Some(rs) => maxfun
+            .saturating_mul(2)
+            .saturating_mul(rs.config.max_restarts.saturating_add(1)),
+        None => maxfun.saturating_mul(2),
+    };
     let mut info = MAXTR_REACHED;
 
     // PRIMA L327: DNORM is set every iteration before use (the Fortran leaves it undefined).
     let mut dnorm = 0.0;
 
+    // Restart machinery (inert with `restart == None`): D3's monotone incumbent record
+    // (`best_x` in the workspace holds the point, in original coordinates), and the
+    // one-restart-body flag — the stall/settle triggers at the rho-reduction hook below set
+    // it and `continue`, so the body exists once, at the top of the loop, where the eval-cap
+    // trigger (which has no reduction site to fire from) must live anyway.
+    let mut best_f = REALMAX;
+    let mut fire_restart = false;
+
     // PRIMA bobyqb.f90 L324: begin the iterative procedure.
     for _tr in 1..=maxtr {
+        // The restart body, entered by any trigger (hard-restart spec §4: a schedule is a set
+        // of triggers, every trigger drives the same restart). The eval-cap trigger is
+        // consulted right here, every iteration — §7.1 measured that the off-pace solves take
+        // no rho reductions after their opening ones, so a reduction-sited trigger has no
+        // site to fire from. `should_restart` gates every fire (settle test + backstops).
+        //
+        // THE REBUILD-ROOM RULE, stated once here and cited at the `reduce_rho` trigger: a
+        // restart must have room to finish its `initxf` rebuild (`maxfun - nf > npt`; spec
+        // §4). Without it the rebuild spends the rest of the budget re-sampling and returns no
+        // usable cycle at all, so short of that room the trigger is inert and the cycle runs on.
+        if let Some(rs) = restart.as_deref_mut() {
+            if !fire_restart
+                && rs.over_cycle_budget(nf, maxfun)
+                && rs.should_restart(fval[kopt], nf, maxfun)
+                && maxfun - nf > npt
+            {
+                fire_restart = true;
+            }
+            if fire_restart {
+                fire_restart = false;
+                let fopt = fval[kopt];
+                // Re-widen exactly as the reduce_rho block resets, but back to rhobeg.
+                rho = rhobeg;
+                delta = rhobeg;
+                dnorm_rec = [REALMAX; 2];
+                moderr_rec = [REALMAX; 2];
+                rs.on_restart(fopt, nf);
+                subinfo = hard_rebuild(
+                    calfun,
+                    maxfun,
+                    ftarget,
+                    rhobeg,
+                    &mut kopt,
+                    &mut nf,
+                    &mut f,
+                    &mut best_f,
+                    x,
+                    xl,
+                    xu,
+                    sl,
+                    su,
+                    xbase,
+                    bmat,
+                    zmat,
+                    xpt,
+                    fval,
+                    gopt,
+                    hq,
+                    pq,
+                    ij,
+                    best_x,
+                    iws,
+                );
+                // A rebuilt model is a fresh solve's opening state, so every per-iteration
+                // carry-over goes back to what PRIMA L284-295 initializes it to. These describe
+                // the model that was just discarded; carrying them across would let the new
+                // cycle's first iteration act on evidence from a model that no longer exists.
+                ebound = 0.0;
+                rescued = false;
+                shortd = false;
+                ratio = -1.0;
+                knew_tr = None;
+                itest = 0;
+                if subinfo != INFO_DFT {
+                    info = subinfo;
+                    break;
+                }
+                // Re-enters the loop BEFORE the post-loop Newton-Raphson tail eval: `info`
+                // is still MAXTR_REACHED here (`subinfo == INFO_DFT` is precisely why it was
+                // not written), so the tail eval's `info == SMALL_TR_RADIUS` gate cannot
+                // fire on a restart cycle. The pending tail step is deliberately deferred to
+                // the true final termination; its result never feeds the model, only the
+                // returned `x`/`f`, and the post-loop selection already picks the best of
+                // the tail eval, the incumbent, and (D3) the record.
+                continue;
+            }
+        }
         // PRIMA bobyqb.f90 L326-328: generate the next trust-region step D.
         let crvmin = trsbox(
             delta,
@@ -987,6 +1310,39 @@ pub(crate) fn bobyqb<F: FnMut(&[f64]) -> f64>(
 
         // PRIMA bobyqb.f90 L612-625: reduce RHO; update DELTA at the same time.
         if reduce_rho {
+            // The restart hook (hard-restart spec §4, stall-restart spec §4).
+            // `Bobyqa` with `restart: None` → inert, and the block reduces RHO exactly as
+            // PRIMA does. Two triggers share this one restart body: at `rho <= rhoend` the
+            // settle test alone decides; at an ordinary reduction the stall counter must
+            // fill first AND `should_restart` still gates it (stall-restart spec D4 — once
+            // no restart remains, the cycle runs to `rho_end`).
+            //
+            // The `maxfun - nf > npt` conjunct is the rebuild-room rule stated at the
+            // loop-top trigger; it sits after `note_reduction` so the stall bookkeeping never
+            // skips a reduction event on account of it.
+            if let Some(rs) = restart.as_deref_mut() {
+                let fopt = fval[kopt];
+                let fire = if rho <= rhoend {
+                    // With the cap set, both triggers say the same thing: restart a cycle that
+                    // turned out expensive. Without this, reaching `rho_end` restarts on its
+                    // own, which on solves that finish inside a few percent of their budget
+                    // buys a second cycle worth nothing — measured at 1.26x the evaluations
+                    // over 268 small LMM cells, with the answers unchanged to round-off.
+                    // Cap off (0.0) keeps the original `rho_end`-only schedule.
+                    (rs.config.cycle_budget_frac <= 0.0 || rs.over_cycle_budget(nf, maxfun))
+                        && rs.should_restart(fopt, nf, maxfun)
+                } else {
+                    // Bookkeeping first (every reduction is a stall-counter event),
+                    // then the gate.
+                    rs.note_reduction(fopt) && rs.should_restart(fopt, nf, maxfun)
+                } && maxfun - nf > npt;
+                if fire {
+                    // Defer to the single restart body at the top of the loop (nothing runs
+                    // in between — this `continue` goes straight there).
+                    fire_restart = true;
+                    continue;
+                }
+            }
             if rho <= rhoend {
                 info = SMALL_TR_RADIUS;
                 break;
@@ -1040,6 +1396,44 @@ pub(crate) fn bobyqb<F: FnMut(&[f64]) -> f64>(
         f = fval[kopt];
     }
 
+    // D3 (hard-restart spec §5): the returned point is a monotone incumbent across cycles —
+    // the better of the record saved before each hard rebuild and anything a later cycle
+    // produced (the same comparison the `fval[kopt] < f` choice above makes with the tail
+    // eval, extended to the record). `best_f` stays REALMAX with `restart == None`, so this
+    // cannot alter that path's result: a real objective value beats REALMAX (evaluate()
+    // moderates every f to <= FUNCMAX < REALMAX).
+    if best_f < f || (f.is_nan() && best_f < REALMAX) {
+        x.copy_from_slice(best_x);
+        f = best_f;
+    }
+
+    // Restart status fold (spec §3.2). Restart-only: `Bobyqa` passes `restart = None`, so
+    // this cannot alter a single byte of its result. Reaching the restart hook at all means the
+    // cycle before it had satisfied PRIMA's `rho <= rhoend` convergence test, holding the very
+    // incumbent this call returns — FVAL(KOPT) is monotone, and a later cycle can only replace it
+    // with a strictly better *evaluated* point (`updatexf` re-points KOPT on strict improvement
+    // only). So once a restart has fired, a numerical-breakdown exit from a LATER cycle reports
+    // "the optional extra cycle could not continue", not "the answer is bad": the convergence was
+    // already earned and the returned point is no worse than the one that earned it. This is not
+    // hypothetical — at `npt = (n+1)(n+2)/2` the interpolation set is fully determined and
+    // machine-precision-tight by the time it converges, and PRIMA's own denominator guard trips
+    // twice running there (RESCUE cannot repair it), which without this fold would surface a
+    // converged, bit-identical-to-`Bobyqa` answer as `ModelDegenerate`. Pinned by
+    // `tests/restart.rs::a_restart_never_downgrades_a_converged_answer_to_model_degenerate`.
+    // Deliberately NOT folded: MAXFUN_REACHED / MAXTR_REACHED and FTARGET_ACHIEVED (the documented
+    // backstops), and any breakdown during the OPENING solve (`restarts_done == 0`) — that one is
+    // exactly what `Bobyqa` would report, so it must still surface.
+    if let Some(rs) = restart.as_deref() {
+        if rs.restarts_done >= 1
+            && matches!(
+                info,
+                DAMAGING_ROUNDING | NAN_INF_MODEL | NAN_INF_X | NAN_INF_F
+            )
+        {
+            info = SMALL_TR_RADIUS;
+        }
+    }
+
     // PRIMA bobyqb.f90 L670-673: rangehist/retmsg omitted.
     (f, nf, info)
 }
@@ -1069,6 +1463,7 @@ mod tests {
             1e-6,
             &mut x,
             &mut ws,
+            None,
         );
         assert_eq!(info, SMALL_TR_RADIUS);
         // Same params/bounds/x0 as the frozen `sphere_n2_npt5` golden, which pins these bit-exact

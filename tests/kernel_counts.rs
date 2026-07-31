@@ -43,13 +43,11 @@ fn report_calvlag_noadd_multiplicity() {
 
     // Larger n: multiplicity should hold (it is per-iteration structure, not n).
     let n10 = measure("sphere n10 npt21", || {
-        let config = Config {
-            npt: 21,
-            rho_begin: 0.5,
-            rho_end: 1e-6,
-            max_fun: 5000,
-            f_target: f64::NEG_INFINITY,
-        };
+        let mut config = Config::new(10);
+        config.npt = 21;
+        config.rho_begin = 0.5;
+        config.rho_end = 1e-6;
+        config.max_fun = 5000;
         let mut solver = Bobyqa::new(10, config).expect("valid config");
         let mut x = [1.0; 10];
         let o = solver.minimize(sphere, &mut x, &[-5.0; 10], &[5.0; 10]);
@@ -58,13 +56,11 @@ fn report_calvlag_noadd_multiplicity() {
 
     // Rescue path (the booth_rescue golden's exact problem — see tests/alloc.rs).
     let rescue = measure("booth_rescue n2 npt5", || {
-        let config = Config {
-            npt: 5,
-            rho_begin: 0.5,
-            rho_end: 1e-12,
-            max_fun: 500,
-            f_target: f64::NEG_INFINITY,
-        };
+        let mut config = Config::new(2);
+        config.npt = 5;
+        config.rho_begin = 0.5;
+        config.rho_end = 1e-12;
+        config.max_fun = 500;
         let mut solver = Bobyqa::new(2, config).expect("valid config");
         let mut x = [0.0, 0.0];
         let o = solver.minimize(booth, &mut x, &[-10.0, -10.0], &[10.0, 2.5]);

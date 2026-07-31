@@ -15,7 +15,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use bobyqa::{Bobyqa, Config, Status};
+use bobyqa::{Bobyqa, Config, RestartConfig, Status};
 
 /// Allocations observed since process start.
 static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
@@ -54,6 +54,13 @@ fn booth(x: &[f64]) -> f64 {
     a * a + b * b
 }
 
+/// Rosenbrock — a single solve reaches `rho_end` well short of a tight optimum, so a
+/// restart-enabled solver restarts on it (`tests/restart.rs` pins that); allocation-free.
+fn rosenbrock(x: &[f64]) -> f64 {
+    let (a, b) = (1.0 - x[0], x[1] - x[0] * x[0]);
+    a * a + 100.0 * b * b
+}
+
 #[test]
 fn minimize_allocates_zero_after_construction_on_warm_and_rescue_paths() {
     // Scaffold sanity (M0): the counter observes an allocation at all.
@@ -90,13 +97,11 @@ fn minimize_allocates_zero_after_construction_on_warm_and_rescue_paths() {
     // was built as a rescue stressor, and the solver is deterministic, so this run takes the
     // rescue branch — proving it alloc-free too (M2 §6: zero means zero, not "zero on the
     // happy path"). The n_eval assert ties this run to the golden trajectory.
-    let config = Config {
-        npt: 5,
-        rho_begin: 0.5,
-        rho_end: 1e-12,
-        max_fun: 500,
-        f_target: f64::NEG_INFINITY,
-    };
+    let mut config = Config::new(2);
+    config.npt = 5;
+    config.rho_begin = 0.5;
+    config.rho_end = 1e-12;
+    config.max_fun = 500;
     let mut solver = Bobyqa::new(2, config).expect("valid config");
     let before = alloc_count();
     for call in 0..3 {
@@ -111,6 +116,44 @@ fn minimize_allocates_zero_after_construction_on_warm_and_rescue_paths() {
             alloc_count(),
             before,
             "rescue-path minimize allocated on call {call} (SPEC §6.4)"
+        );
+    }
+
+    // Restart path: the same guarantee with restarts enabled. `Bobyqa::new` stays the sole
+    // allocation site — the restart bookkeeping is a stack `RestartState`, the rebuild runs
+    // `initxf` over the buffers `new` already sized for the opening solve, and the per-cycle
+    // boundary store is pre-sized `max_restarts + 1` so filling it never reallocates. The
+    // schedule below actually restarts on Rosenbrock, so the measured warm path includes a
+    // whole rebuild and not merely the re-widening; the restart-count assert is what keeps
+    // that true if the trajectory ever shifts. The stall trigger drives it rather than the
+    // shipped default's eval cap, which on this budget may leave the cycle inside its
+    // allowance and fire nothing.
+    let mut restart = RestartConfig::new();
+    restart.cycle_budget_frac = 0.0;
+    restart.stall_reductions = 2;
+    restart.max_restarts = 8;
+    let mut config = Config::new(2);
+    config.restart = Some(restart);
+    let mut solver = Bobyqa::new(2, config).expect("valid config");
+    let before = alloc_count();
+    for call in 0..3 {
+        let mut x = [-1.2, 1.0]; // stack array — fresh start without heap traffic
+        let o = solver.minimize(rosenbrock, &mut x, &[-5.0, -5.0], &[5.0, 5.0]);
+        assert_eq!(o.status, Status::Converged, "restart call {call}");
+        assert!(
+            solver.last_restart_count() >= 1,
+            "restart call {call}: no restart fired, so the relocation path went unmeasured"
+        );
+        assert_eq!(
+            solver.last_cycle_boundaries().len(),
+            solver.last_restart_count(),
+            "restart call {call}: one boundary per restart"
+        );
+        assert_eq!(
+            alloc_count(),
+            before,
+            "restart-enabled minimize allocated on call {call} (the zero-alloc warm path \
+             across the restart hook, point relocation, and the boundary store)"
         );
     }
 }

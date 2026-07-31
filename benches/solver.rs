@@ -30,12 +30,10 @@ const CASES: &[(usize, usize)] = &[(2, 5), (3, 6), (6, 10), (3, 7), (4, 9), (5, 
 
 fn bench_minimize(c: &mut Criterion) {
     for &(n, npt) in CASES {
-        let config = Config {
-            npt,
-            rho_begin: 0.5,
-            rho_end: 1e-6,
-            ..Config::new(n)
-        };
+        let mut config = Config::new(n);
+        config.npt = npt;
+        config.rho_begin = 0.5;
+        config.rho_end = 1e-6;
 
         // Interior optimum: the full TR loop with mostly-free variables.
         let mut solver = Bobyqa::new(n, config).unwrap();

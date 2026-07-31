@@ -46,6 +46,76 @@ let outcome = solver.minimize(
 println!("f = {:.2e} at {:?} after {} evaluations", outcome.f, x, outcome.n_eval);
 ```
 
+## Restarts
+
+By default `Bobyqa` stops the moment `rho` reaches `rho_end` — the faithful PRIMA
+behaviour. On some objectives that single convergence stalls short of the true optimum:
+noisy or quantized landscapes, staircase functions, anything where the local quadratic
+model runs out of useful curvature before `x` does. And on hard fits the last `rho`
+levels can burn most of the budget squeezing out digits that no longer matter. For
+those, set `Config::restart`. Instead of stopping, the solver starts a new cycle: `rho`
+and `delta` go back to `rho_begin` and the interpolation set is rebuilt from scratch
+around the best point found so far. Because the model is discarded rather than
+re-widened, the new cycle samples a full `rho_begin` out and can walk out of the basin
+the previous one converged in. The returned point is the best over every cycle, so a
+restart never returns something worse than stopping would have.
+
+```rust
+use bobyqa::{Bobyqa, Config, RestartConfig};
+
+// Same problem as above, but with restarts enabled — RestartConfig::new() is the
+// recommended schedule: one restart, fired when a cycle has spent an eighth of the
+// budget that remained when it started.
+let mut config = Config::new(2);
+config.restart = Some(RestartConfig::new());
+let mut solver = Bobyqa::new(2, config)?;
+
+let mut x = [0.0, 0.0];
+let outcome = solver.minimize(
+    |x| (1.0 - x[0]).powi(2) + 100.0 * (x[1] - x[0] * x[0]).powi(2),
+    &mut x,
+    &[-2.0, -2.0],
+    &[ 2.0,  2.0],
+);
+
+println!(
+    "f = {:.2e} at {:?} after {} evaluations, {} restarts",
+    outcome.f, x, outcome.n_eval, solver.last_restart_count(),
+);
+```
+
+The knobs live on `RestartConfig`:
+
+- `cycle_budget_frac` — the eval cap, and the recommended way to drive the schedule:
+  restart once the current cycle has spent this fraction of the budget that *remained
+  when the cycle started* (default `0.125`; `0.0` disables it). It is consulted at every
+  trust-region iteration, so it fires even on a cycle that is crawling without reducing
+  `rho`.
+- `max_restarts` — cap on restarts before returning the last cycle's result (default
+  `1`). A long schedule divides a fixed `max_fun` into cycles too short to descend.
+- `improve_rel_tol` — stop restarting once a full cycle's improvement falls below this,
+  relative to `max(1, |f|)` (default `1e-6`).
+- `stall_reductions` — restart before `rho` reaches `rho_end`, after this many
+  consecutive `rho` reductions that each improve `f` by less than `improve_rel_tol`
+  (default `0`: off). It only fires where the solve reduces `rho` at all, which is why
+  `cycle_budget_frac` is the recommended trigger instead.
+
+Whichever trigger fires, the final cycle — once no restart remains — always runs down to
+`rho_end`, so the returned point is never coarser than a plain solve's.
+
+**Setting the cap changes what the `rho_end` trigger does.** With `cycle_budget_frac`
+non-zero, reaching `rho_end` no longer restarts by itself — it restarts only when the cap
+agrees the cycle was expensive. So a solve that converges well inside its cap is left
+alone and returns exactly what `restart: None` returns, evaluation count included. With
+the cap off, `rho_end` restarts on the settle test as before.
+
+**`Config::max_fun` is the TOTAL evaluation budget across all restarts**, not a
+per-cycle allowance — size it accordingly when enabling restarts.
+
+`Config` and `RestartConfig` are `#[non_exhaustive]`: build them with `Config::new(n)` /
+`RestartConfig::new()` and assign fields, as above — struct literals and
+`..Config::new(n)` update syntax won't compile downstream.
+
 ## Design
 
 | Design | Detail |

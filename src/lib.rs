@@ -5,14 +5,23 @@
 //! Trajectory-parity-tested **bit-exact** against PRIMA (natively and on
 //! `wasm32-wasip1`).
 //!
+//! One public solver surface: [`Bobyqa`], the faithful PRIMA port. By default it
+//! stops as soon as `rho` reaches `rho_end`; setting [`Config::restart`] lets the
+//! solve continue instead — `rho`/`delta` go back to `rho_begin` and the
+//! interpolation set is rebuilt from scratch around the best point found — for
+//! objectives where a single `rho_end` convergence stalls short (noisy or
+//! quantized landscapes, long `rho` tails on hard fits). With `restart: None` the
+//! solver is bit-exact-unchanged by the restart machinery's existence.
+//!
 //! Three invariants hold across every call:
 //! - **Feasibility** — every point at which the objective is evaluated lies
 //!   within `[lower, upper]`.
 //! - **Determinism** — no global mutable state, no RNG, no I/O, no threads;
 //!   identical inputs give identical outputs on a given target.
-//! - **Zero-alloc warm path** — [`Bobyqa::new`] is the sole heap-allocation
-//!   site; a built [`Bobyqa`] then runs [`Bobyqa::minimize`] with no further
-//!   allocation.
+//! - **Zero-alloc warm path** — heap allocation happens only at construction time
+//!   ([`Bobyqa::new`] is the sole allocation site, sized once for the problem's
+//!   `(n, npt)` and restart schedule); a built solver then runs
+//!   [`Bobyqa::minimize`] with no further allocation.
 
 #![forbid(unsafe_code)]
 
@@ -40,8 +49,10 @@ use consts::{
 use util::moderatex1;
 
 /// Tuning knobs for [`Bobyqa`]. No `Default`: `npt`'s default (`2n + 1`) needs `n` —
-/// use [`Config::new`] and struct-update syntax for overrides.
+/// start from [`Config::new`] and assign the fields to override (`#[non_exhaustive]`
+/// rules out struct literals, update syntax included, outside this crate).
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct Config {
     /// Number of interpolation points, in `n + 2 ..= (n + 1)(n + 2) / 2` (default `2n + 1`,
     /// Powell's recommendation). The `npt` initial model-building evaluations are a per-call
@@ -57,6 +68,12 @@ pub struct Config {
     /// Stop as soon as an evaluation reaches `f <= f_target` (default `-inf`: disabled).
     /// NaN is rejected by [`Bobyqa::new`].
     pub f_target: f64,
+    /// Restart schedule. `None` (the default) is plain BOBYQA — bit-identical to 0.1.x:
+    /// the solve ends the moment `rho` reaches `rho_end`. `Some` starts a new cycle instead:
+    /// `rho`/`delta` go back to `rho_begin` and the interpolation set is rebuilt from scratch
+    /// around the best point found — see [`RestartConfig`] for what triggers that and what
+    /// stops it. `max_fun` stays the TOTAL evaluation budget across all cycles.
+    pub restart: Option<RestartConfig>,
 }
 
 impl Config {
@@ -71,6 +88,8 @@ impl Config {
             // PRIMA's FTARGET_DFT is -REALMAX, which would terminate on f = -REALMAX;
             // -inf is strictly "off" (design §4.2).
             f_target: f64::NEG_INFINITY,
+            // Off by default (stall-restart spec D5): existing users' numerics must not move.
+            restart: None,
         }
     }
 }
@@ -78,7 +97,11 @@ impl Config {
 /// Why the solver stopped (or why construction failed).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
-    /// The trust-region radius reached `rho_end`.
+    /// The trust-region radius reached `rho_end`, with any restart schedule settled there —
+    /// with [`Config::restart`] `None` that is the whole story; with restarts enabled it
+    /// additionally means no further restart cycle was due (the
+    /// [`RestartConfig::improve_rel_tol`] settle test, or the
+    /// [`max_restarts`](RestartConfig::max_restarts) cap) or a later cycle could not continue.
     Converged,
     /// An evaluation reached `f_target`.
     TargetReached,
@@ -93,7 +116,9 @@ pub enum Status {
 impl core::fmt::Display for Status {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(match self {
-            Status::Converged => "the trust-region radius reached rho_end",
+            Status::Converged => {
+                "the trust-region radius reached rho_end, with any restart schedule settled"
+            }
             Status::TargetReached => "an evaluation reached f_target",
             Status::MaxFunReached => "the max_fun evaluation budget was exhausted",
             Status::ModelDegenerate => "the interpolation model degenerated beyond rescue",
@@ -158,6 +183,12 @@ pub struct Bobyqa {
     /// allocation site; `minimize` re-initializes whatever it reads (the zero-alloc warm
     /// path, enforced by `tests/alloc.rs`).
     ws: bobyqb::SolverWs,
+    last_restarts: usize,
+    /// Per-cycle instrumentation backing store (stall-restart spec §5): sized
+    /// `max_restarts + 1` in [`Bobyqa::new`] when restarts are enabled (empty otherwise), lent
+    /// to the engine per call, so filling it — at most one entry per restart — never allocates
+    /// inside `minimize`.
+    cycle_boundaries: Vec<usize>,
 }
 
 impl Bobyqa {
@@ -169,11 +200,14 @@ impl Bobyqa {
     /// outside `n + 2 ..= (n + 1)(n + 2) / 2` (PRIMA's preprocessing would
     /// clamp; we reject); `rho_begin` not a positive finite number; `rho_end`
     /// not in `(0, rho_begin]`; `max_fun <= npt` (PRIMA preproc would raise; we
-    /// reject); `f_target` NaN.
+    /// reject); `f_target` NaN. With `restart` set, additionally: `max_restarts`
+    /// zero; `improve_rel_tol` negative or NaN; `cycle_budget_frac` outside
+    /// `[0.0, 1.0]` or NaN.
     ///
     /// # Panics
     ///
     /// Never — invalid `(n, config)` is reported through [`Status::InvalidArgs`].
+    #[expect(clippy::neg_cmp_op_on_partial_ord)] // `!(a >= b)` is load-bearing for NaN — never `a < b`
     pub fn new(n: usize, config: Config) -> Result<Self, Status> {
         if n == 0 {
             return Err(Status::InvalidArgs);
@@ -196,10 +230,29 @@ impl Bobyqa {
         if config.f_target.is_nan() {
             return Err(Status::InvalidArgs);
         }
+        if let Some(restart) = config.restart {
+            if restart.max_restarts < 1 {
+                return Err(Status::InvalidArgs);
+            }
+            if !(restart.improve_rel_tol >= 0.0) {
+                return Err(Status::InvalidArgs);
+            }
+            // NaN fails the range test (the `!(..)` form is load-bearing, as above).
+            if !(restart.cycle_budget_frac >= 0.0 && restart.cycle_budget_frac <= 1.0) {
+                return Err(Status::InvalidArgs);
+            }
+        }
         Ok(Self {
             n,
             config,
             ws: bobyqb::SolverWs::new(n, config.npt),
+            last_restarts: 0,
+            // The per-cycle instrumentation store (stall-restart spec §5): one slot per
+            // possible restart plus one spare, so `minimize` fills it without reallocating.
+            cycle_boundaries: match config.restart {
+                Some(restart) => Vec::with_capacity(restart.max_restarts + 1),
+                None => Vec::new(),
+            },
         })
     }
 
@@ -226,7 +279,6 @@ impl Bobyqa {
     /// );
     /// assert!(outcome.f < 1e-8);
     /// ```
-    #[expect(clippy::needless_range_loop)] // explicit indexed loops mirror PRIMA (rust.md §5)
     pub fn minimize<F: FnMut(&[f64]) -> f64>(
         &mut self,
         f: F,
@@ -234,7 +286,9 @@ impl Bobyqa {
         lower: &[f64],
         upper: &[f64],
     ) -> Outcome {
-        if !self.args_are_valid(x, lower, upper) {
+        self.last_restarts = 0;
+        self.cycle_boundaries.clear();
+        if !prepare_call(self.n, &self.config, &mut self.ws, x, lower, upper) {
             // f is NaN because nothing was evaluated.
             return Outcome {
                 f: f64::NAN,
@@ -242,44 +296,19 @@ impl Bobyqa {
                 status: Status::InvalidArgs,
             };
         }
-        // PRIMA bobyqa.f90 L287-301: clamp bounds at +/-BOUNDMAX ("no bound" sentinel,
-        // consts.F90 L172). NaN bounds were rejected above; only the magnitude clamp remains.
-        // The clamped copies live in the solver workspace (M2 §4: zero-alloc warm path).
-        for i in 0..self.n {
-            self.ws.bobyqb.xl[i] = lower[i].max(-BOUNDMAX);
-            self.ws.bobyqb.xu[i] = upper[i].min(BOUNDMAX);
-        }
         let rhobeg = self.config.rho_begin;
 
-        // PRIMA bobyqa.f90 L316: x = max(xl, min(xu, moderatex(x))) — in place, elementwise
-        // (each x[i] depends only on x[i], so the moderate-then-clamp order is FP-identical
-        // to the former moderatex-copy-then-clamp).
-        for i in 0..self.n {
-            let xm = moderatex1(x[i]);
-            x[i] = self.ws.bobyqb.xl[i].max(self.ws.bobyqb.xu[i].min(xm));
-        }
-
-        // PRIMA preproc.f90 L341-350 (HONOUR_X0 = FALSE — the path the oracle runs; SPEC §7.6):
-        // revise X0 so its distance to each inactive bound is 0 or >= rhobeg. Valid because
-        // validation guarantees XU - XL >= 2*RHOBEG and X is in the box (the L338 precondition).
-        // The follow-up rhobeg-revision block (preproc.f90 L367-383) is omitted: after this
-        // revision it is "unnecessary in precise arithmetic" (PRIMA's own L368 N.B.), and its
-        // rounding-error repairs fall under the no-repair stance — validation rejects, never fixes.
-        for i in 0..self.n {
-            if x[i] <= self.ws.bobyqb.xl[i] + 0.5 * rhobeg {
-                x[i] = self.ws.bobyqb.xl[i];
-            } else if x[i] < self.ws.bobyqb.xl[i] + rhobeg {
-                x[i] = self.ws.bobyqb.xl[i] + rhobeg;
-            }
-        }
-        for i in 0..self.n {
-            if x[i] >= self.ws.bobyqb.xu[i] - 0.5 * rhobeg {
-                x[i] = self.ws.bobyqb.xu[i];
-            } else if x[i] > self.ws.bobyqb.xu[i] - rhobeg {
-                x[i] = self.ws.bobyqb.xu[i] - rhobeg;
-            }
-        }
-
+        // The boundary store is lent to the engine by `take` (a pointer swap, no allocation)
+        // and recovered below, keeping `RestartState` free of borrows into `self`.
+        let mut restart_state = self.config.restart.map(|rc| bobyqb::RestartState {
+            config: rc,
+            restarts_done: 0,
+            last_fopt: None,
+            stall_count: 0,
+            stall_fopt: None,
+            nf_cycle_start: 0,
+            cycle_boundaries: core::mem::take(&mut self.cycle_boundaries),
+        });
         let mut f = f;
         let (fopt, nf, info) = bobyqb::bobyqb(
             &mut f,
@@ -294,7 +323,12 @@ impl Bobyqa {
             self.config.rho_end,
             x,
             &mut self.ws,
+            restart_state.as_mut(),
         );
+        if let Some(rs) = restart_state {
+            self.last_restarts = rs.restarts_done;
+            self.cycle_boundaries = rs.cycle_boundaries;
+        }
         Outcome {
             f: fopt,
             n_eval: nf,
@@ -302,23 +336,20 @@ impl Bobyqa {
         }
     }
 
-    // The per-call checks: slice lengths; bounds NaN-free, ordered, and at least
-    // `2 * rho_begin` apart (PRIMA's `NO_SPACE_BETWEEN_BOUNDS`, caught up front; +/-inf bounds
-    // are legal); x NaN-free. Config repair is rejected, x-space handling stays faithful to
-    // PRIMA. Ordering and gap are judged on the ±BOUNDMAX-clamped bounds, mirroring PRIMA's
-    // clamp-then-check order: a bound beyond ±BOUNDMAX passes the raw checks yet clamps to a
-    // crossed or too-narrow box in `minimize`. Clamping only shrinks the box, so this is
-    // strictly stronger than the raw checks and identical for every bound within ±BOUNDMAX.
-    fn args_are_valid(&self, x: &[f64], lower: &[f64], upper: &[f64]) -> bool {
-        x.len() == self.n
-            && lower.len() == self.n
-            && upper.len() == self.n
-            && !lower.iter().chain(upper).any(|v| v.is_nan())
-            && lower.iter().zip(upper).all(|(l, u)| {
-                let (cl, cu) = (l.max(-BOUNDMAX), u.min(BOUNDMAX));
-                cl <= cu && cu - cl >= 2.0 * self.config.rho_begin
-            })
-            && !x.iter().any(|v| v.is_nan())
+    /// Restarts performed on the last [`Bobyqa::minimize`] call — always 0 when
+    /// [`Config::restart`] is `None` (and before the first call).
+    #[must_use]
+    pub fn last_restart_count(&self) -> usize {
+        self.last_restarts
+    }
+
+    /// Cumulative evaluation count at each restart boundary of the last [`Bobyqa::minimize`]
+    /// call — one entry per restart, so empty when none fired (and always empty when
+    /// [`Config::restart`] is `None`). Diff each entry against the next (the last against
+    /// [`Outcome::n_eval`]) for per-cycle evaluation costs.
+    #[must_use]
+    pub fn last_cycle_boundaries(&self) -> &[usize] {
+        &self.cycle_boundaries
     }
 }
 
@@ -366,9 +397,164 @@ pub fn bobyqa<F: FnMut(&[f64]) -> f64>(
     }
 }
 
+// The per-call checks: slice lengths; bounds NaN-free, ordered, and at least
+// `2 * rho_begin` apart (PRIMA's `NO_SPACE_BETWEEN_BOUNDS`, caught up front; +/-inf bounds
+// are legal); x NaN-free. Config repair is rejected, x-space handling stays faithful to
+// PRIMA. Ordering and gap are judged on the ±BOUNDMAX-clamped bounds, mirroring PRIMA's
+// clamp-then-check order: a bound beyond ±BOUNDMAX passes the raw checks yet clamps to a
+// crossed or too-narrow box in `minimize`. Clamping only shrinks the box, so this is
+// strictly stronger than the raw checks and identical for every bound within ±BOUNDMAX.
+fn args_are_valid(n: usize, config: &Config, x: &[f64], lower: &[f64], upper: &[f64]) -> bool {
+    x.len() == n
+        && lower.len() == n
+        && upper.len() == n
+        && !lower.iter().chain(upper).any(|v| v.is_nan())
+        && lower.iter().zip(upper).all(|(l, u)| {
+            let (cl, cu) = (l.max(-BOUNDMAX), u.min(BOUNDMAX));
+            cl <= cu && cu - cl >= 2.0 * config.rho_begin
+        })
+        && !x.iter().any(|v| v.is_nan())
+}
+
+// `Bobyqa::minimize`'s per-call preamble: validate args,
+// clamp bounds into `ws`, preproc x0. Returns `false` (leaving `ws`/`x` untouched beyond
+// whatever `args_are_valid` itself reads) when the runtime args are rejected.
+#[expect(clippy::needless_range_loop)] // explicit indexed loops mirror PRIMA (rust.md §5)
+fn prepare_call(
+    n: usize,
+    config: &Config,
+    ws: &mut bobyqb::SolverWs,
+    x: &mut [f64],
+    lower: &[f64],
+    upper: &[f64],
+) -> bool {
+    if !args_are_valid(n, config, x, lower, upper) {
+        return false;
+    }
+    // PRIMA bobyqa.f90 L287-301: clamp bounds at +/-BOUNDMAX ("no bound" sentinel,
+    // consts.F90 L172). NaN bounds were rejected above; only the magnitude clamp remains.
+    // The clamped copies live in the solver workspace (M2 §4: zero-alloc warm path).
+    for i in 0..n {
+        ws.bobyqb.xl[i] = lower[i].max(-BOUNDMAX);
+        ws.bobyqb.xu[i] = upper[i].min(BOUNDMAX);
+    }
+    let rhobeg = config.rho_begin;
+
+    // PRIMA bobyqa.f90 L316: x = max(xl, min(xu, moderatex(x))) — in place, elementwise
+    // (each x[i] depends only on x[i], so the moderate-then-clamp order is FP-identical
+    // to the former moderatex-copy-then-clamp).
+    for i in 0..n {
+        let xm = moderatex1(x[i]);
+        x[i] = ws.bobyqb.xl[i].max(ws.bobyqb.xu[i].min(xm));
+    }
+
+    // PRIMA preproc.f90 L341-350 (HONOUR_X0 = FALSE — the path the oracle runs; SPEC §7.6):
+    // revise X0 so its distance to each inactive bound is 0 or >= rhobeg. Valid because
+    // validation guarantees XU - XL >= 2*RHOBEG and X is in the box (the L338 precondition).
+    // The follow-up rhobeg-revision block (preproc.f90 L367-383) is omitted: after this
+    // revision it is "unnecessary in precise arithmetic" (PRIMA's own L368 N.B.), and its
+    // rounding-error repairs fall under the no-repair stance — validation rejects, never fixes.
+    for i in 0..n {
+        if x[i] <= ws.bobyqb.xl[i] + 0.5 * rhobeg {
+            x[i] = ws.bobyqb.xl[i];
+        } else if x[i] < ws.bobyqb.xl[i] + rhobeg {
+            x[i] = ws.bobyqb.xl[i] + rhobeg;
+        }
+    }
+    for i in 0..n {
+        if x[i] >= ws.bobyqb.xu[i] - 0.5 * rhobeg {
+            x[i] = ws.bobyqb.xu[i];
+        } else if x[i] > ws.bobyqb.xu[i] - rhobeg {
+            x[i] = ws.bobyqb.xu[i] - rhobeg;
+        }
+    }
+    true
+}
+
+/// The restart schedule, plugged in via [`Config::restart`]. A restart puts `rho`/`delta`
+/// back to `rho_begin` and rebuilds the interpolation set from scratch around the best point
+/// found so far, then carries on; the returned point is the best over every cycle, so a
+/// restart can never return something worse than stopping would have.
+///
+/// `Config::max_fun` stays the TOTAL evaluation budget across all restarts.
+/// Start from [`RestartConfig::new`] and assign fields to override
+/// (`#[non_exhaustive]`, like [`Config`]).
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub struct RestartConfig {
+    /// Cap on restarts before returning the last cycle's result. The recommended schedule
+    /// pairs this at `1` with [`cycle_budget_frac`](Self::cycle_budget_frac) `0.125`: a long
+    /// schedule divides a fixed `max_fun` into cycles too short to descend, so each one
+    /// rebuilds a model it then cannot exploit.
+    pub max_restarts: usize,
+    /// Stop restarting once a full cycle improves the best value by less than this,
+    /// relative to `max(1, |f|)` — the settle test. The same threshold also defines a
+    /// *stalled* `rho` reduction for [`stall_reductions`](Self::stall_reductions): "an
+    /// improvement this small is not worth chasing" is one judgement, applied at both scales.
+    pub improve_rel_tol: f64,
+    /// Consecutive `rho` reductions improving the best value by less than
+    /// [`improve_rel_tol`](Self::improve_rel_tol) (relative to `max(1, |f|)`) that trigger a
+    /// restart before `rho` reaches `rho_end`, cutting a stalled `rho` tail instead of paying
+    /// for the rest of it. `0` disables this trigger.
+    ///
+    /// It only fires where the solve takes `rho` reductions at all; a cycle that crawls
+    /// without reducing `rho` has no site for it to fire from, which is what
+    /// [`cycle_budget_frac`](Self::cycle_budget_frac) — the documented trigger — covers
+    /// instead.
+    ///
+    /// Whichever the trigger, the final cycle — once no restart remains — always runs down to
+    /// `rho_end`, so the returned point is never coarser than a plain solve's.
+    pub stall_reductions: usize,
+    /// The eval-cap trigger, and the documented way to drive the schedule: restart once the
+    /// current cycle has spent at least this fraction of the evaluation budget that *remained
+    /// when the cycle started*, without settling. `0.0` disables it. Consulted at every
+    /// trust-region iteration, so unlike [`stall_reductions`](Self::stall_reductions) it fires
+    /// on a cycle that is crawling without reducing `rho`. Measuring against the remainder
+    /// rather than `max_fun` makes successive cut points geometric, so the schedule is
+    /// self-limiting.
+    ///
+    /// Recommended: `0.125` together with [`max_restarts`](Self::max_restarts) `1` (measured
+    /// on large LMM fits).
+    ///
+    /// **Setting this changes what the `rho_end` trigger does.** With the cap on, reaching
+    /// `rho_end` no longer restarts by itself — it restarts only when the cap agrees the cycle
+    /// was expensive. The user-visible consequence: a solve that converges well inside its cap
+    /// is left alone and returns exactly what [`Config::restart`] `None` returns, evaluation
+    /// count included. With the cap off (`0.0`), `rho_end` restarts on the settle test as
+    /// before, so the settle and stall schedules are unchanged.
+    pub cycle_budget_frac: f64,
+}
+
+impl RestartConfig {
+    /// The recommended schedule: one restart, triggered when a cycle has spent an eighth of
+    /// the budget that remained when it started, stopping when a cycle's improvement falls
+    /// below `1e-6` relative to `max(1, |f|)`.
+    ///
+    /// [`stall_reductions`](Self::stall_reductions) is off here: the eval cap covers the
+    /// stalled-tail case and fires on crawling cycles the stall counter cannot see. A solve
+    /// that finishes well inside its cap is untouched by this schedule — same point, same
+    /// evaluation count as [`Config::restart`] `None`.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            max_restarts: 1,
+            improve_rel_tol: 1e-6,
+            stall_reductions: 0,
+            cycle_budget_frac: 0.125,
+        }
+    }
+}
+impl Default for RestartConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // The PRIMA-info -> `Status` mapping. `SMALL_TR_RADIUS` shares PRIMA's value 0 with `INFO_DFT`
-// (a normal loop exit IS convergence). `MAXTR_REACHED` is budget-class (`maxtr = 2 * max_fun`,
-// near-unreachable). `NAN_INF_X`/`NAN_INF_F` are `checkexit` defensive guards, near-unreachable
+// (a normal loop exit IS convergence). `MAXTR_REACHED` is budget-class (`maxtr = 2 * max_fun` on
+// `Bobyqa`, scaled by `max_restarts + 1` when restarts are enabled to absorb a worst-case zero-eval
+// iteration burst per restart cycle; near-unreachable on both paths). `NAN_INF_X`/`NAN_INF_F` are
+// `checkexit` defensive guards, near-unreachable
 // behind `moderatex`/`moderatef` — numerical-breakdown class. `NO_SPACE_BETWEEN_BOUNDS` is
 // caught by validation before the loop. `TRSUBP_FAILED` is never emitted by the BOBYQA port
 // (`trsbox` returns only CRVMIN, no info code) — the constant exists for completeness against
@@ -650,6 +836,71 @@ mod tests {
     fn status_displays_and_is_an_error() {
         let e: &dyn std::error::Error = &Status::InvalidArgs;
         assert!(!e.to_string().is_empty());
+    }
+
+    #[test]
+    fn restart_config_new_returns_the_documented_defaults() {
+        let r = RestartConfig::new();
+        assert_eq!(r.max_restarts, 1);
+        assert_eq!(r.improve_rel_tol, 1e-6);
+        assert_eq!(r.stall_reductions, 0);
+        assert_eq!(r.cycle_budget_frac, 0.125);
+    }
+
+    // Builds the `Config` the way a downstream crate must under `#[non_exhaustive]`:
+    // `Config::new` + field assignment, restart knobs included.
+    fn with_restart(n: usize, r: RestartConfig) -> Config {
+        let mut c = Config::new(n);
+        c.restart = Some(r);
+        c
+    }
+
+    #[test]
+    fn new_accepts_valid_and_rejects_bad_restart_knobs() {
+        let r = RestartConfig::new();
+        let ok = |rc: RestartConfig| Bobyqa::new(2, with_restart(2, rc)).is_ok();
+        assert!(ok(r)); // npt = 5
+        // max_restarts >= 1
+        assert!(!ok(RestartConfig {
+            max_restarts: 0,
+            ..r
+        }));
+        // improve_rel_tol >= 0
+        assert!(!ok(RestartConfig {
+            improve_rel_tol: -1.0,
+            ..r
+        }));
+        // stall_reductions is unconstrained: any count is as valid as the default 0 (off)
+        assert!(ok(RestartConfig {
+            stall_reductions: 2,
+            ..r
+        }));
+        // cycle_budget_frac in [0.0, 1.0], NaN rejected
+        assert!(ok(RestartConfig {
+            cycle_budget_frac: 1.0,
+            ..r
+        }));
+        assert!(!ok(RestartConfig {
+            cycle_budget_frac: -0.1,
+            ..r
+        }));
+        assert!(!ok(RestartConfig {
+            cycle_budget_frac: 1.5,
+            ..r
+        }));
+        assert!(!ok(RestartConfig {
+            cycle_budget_frac: f64::NAN,
+            ..r
+        }));
+        // the plain Config knobs are validated the same with restarts on
+        assert!(Bobyqa::new(0, with_restart(1, r)).is_err());
+    }
+
+    #[test]
+    fn restart_accessors_are_empty_before_any_minimize() {
+        let s = Bobyqa::new(2, with_restart(2, RestartConfig::new())).unwrap();
+        assert_eq!(s.last_restart_count(), 0);
+        assert!(s.last_cycle_boundaries().is_empty());
     }
 
     #[test]

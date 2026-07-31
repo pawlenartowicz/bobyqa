@@ -392,13 +392,11 @@ fn repeated_minimize_on_one_solver_is_bit_identical() {
     // evaluation trajectories bitwise catches cross-call stale-workspace leakage that the
     // fresh-solver golden test above cannot see.
     for g in load_goldens() {
-        let config = Config {
-            npt: g.npt,
-            rho_begin: g.rho_begin,
-            rho_end: g.rho_end,
-            max_fun: g.max_fun,
-            f_target: f64::NEG_INFINITY,
-        };
+        let mut config = Config::new(g.n);
+        config.npt = g.npt;
+        config.rho_begin = g.rho_begin;
+        config.rho_end = g.rho_end;
+        config.max_fun = g.max_fun;
         let mut solver = Bobyqa::new(g.n, config).expect("golden config is valid");
         let f = objective(&g.problem);
         let run = |solver: &mut Bobyqa| {
@@ -459,13 +457,12 @@ fn full_trajectory_matches_every_golden() {
     // capture and asserts the full evaluation trajectory bitwise, so any deviation is a
     // port-faithfulness or determinism regression, not a tolerance miss.
     for g in load_goldens() {
-        let config = Config {
-            npt: g.npt,
-            rho_begin: g.rho_begin,
-            rho_end: g.rho_end,
-            max_fun: g.max_fun,
-            f_target: f64::NEG_INFINITY, // matches the driver's hardcoded -INFINITY
-        };
+        // f_target stays Config::new's -INFINITY default — matches the driver's hardcoded value.
+        let mut config = Config::new(g.n);
+        config.npt = g.npt;
+        config.rho_begin = g.rho_begin;
+        config.rho_end = g.rho_end;
+        config.max_fun = g.max_fun;
         let mut solver = Bobyqa::new(g.n, config).expect("golden config is valid");
         let f = objective(&g.problem);
         let mut trajectory: Vec<(Vec<f64>, f64)> = Vec::new();
