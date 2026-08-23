@@ -598,7 +598,8 @@ pub(crate) fn trsbox(
         if let Some(ia) = iact {
             if hangt >= hangt_bd {
                 // PRIMA L552: D(IACT) reaches lower/upper bound.
-                xbdi[ia] = 1.0_f64.copysign(xopt[ia] + d[ia] - f64::midpoint(sl[ia], su[ia])) as i32;
+                xbdi[ia] =
+                    1.0_f64.copysign(xopt[ia] + d[ia] - f64::midpoint(sl[ia], su[ia])) as i32;
             } else if !(sdec > tol * qred) {
                 // PRIMA L554: literal negation — SDEC small or NaN.
                 break;
