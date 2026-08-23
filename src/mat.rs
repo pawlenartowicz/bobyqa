@@ -3,6 +3,8 @@
 //! A PRIMA array `A(nr, nc)` becomes a `Mat` with `a[[i, j]] = data[i + j*nr]`, 0-based; same
 //! memory order as Fortran, so index translation is mechanical and `A(:, k)` column slices are
 //! contiguous. No math methods: arithmetic stays in explicit loops that mirror PRIMA.
+use alloc::vec;
+use alloc::vec::Vec;
 use core::ops::{Index, IndexMut};
 
 #[derive(Debug, Clone)]
@@ -12,11 +14,27 @@ pub(crate) struct Mat {
 }
 
 impl Mat {
+    /// Infallible zero matrix — test-only construction sites (safe-checks spec S2: the
+    /// production construction path goes through [`Mat::try_zeros`]).
+    #[allow(dead_code)] // test modules only; production code must use try_zeros
     pub(crate) fn zeros(nrows: usize, ncols: usize) -> Self {
         Self {
             data: vec![0.0; nrows * ncols],
             nrows,
         }
+    }
+
+    /// Fallible zero matrix (safe-checks spec S2): an unsatisfiable allocation surfaces as
+    /// `Err` instead of aborting. `nrows * ncols` itself is unchecked — `ws_dims_ok` in
+    /// `Bobyqa::new` has already rejected any `(n, npt)` whose buffer sizes could overflow.
+    pub(crate) fn try_zeros(
+        nrows: usize,
+        ncols: usize,
+    ) -> Result<Self, alloc::collections::TryReserveError> {
+        Ok(Self {
+            data: crate::util::try_vec(0.0, nrows * ncols)?,
+            nrows,
+        })
     }
 
     #[allow(dead_code)] // §3.4 audited constructor; used by test_support.rs parser and test modules (cfg(test) only)
@@ -83,6 +101,8 @@ impl IndexMut<[usize; 2]> for Mat {
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec;
+
     use super::Mat;
 
     #[test]

@@ -8,6 +8,11 @@
 //! branches on `idz` carries a citation note.
 use crate::linalg::{inprod, matprod12_into, matprod21_into};
 use crate::mat::Mat;
+use crate::util::try_vec;
+use alloc::collections::TryReserveError;
+#[cfg(test)]
+use alloc::vec;
+use alloc::vec::Vec;
 
 /// Dev-only `calvlag_noadd` invocation counter (Layer-0 spec §9 F0a). Compiled in **only** under
 /// the `count-kernels` feature; the default build has no global state (SPEC §1 aim 4 —
@@ -168,17 +173,17 @@ pub(crate) struct CalWs {
 }
 
 impl CalWs {
-    pub(crate) fn new(n: usize, npt: usize) -> Self {
-        Self {
-            wcheck: vec![0.0; npt],
-            xrefxpt: vec![0.0; npt],
-            xz: vec![0.0; npt - n - 1],
-            omega: vec![0.0; npt],
-            wmv: vec![0.0; npt + n],
-            vlag_beta: vec![0.0; npt + n],
-            vlag_den: vec![0.0; npt + n],
-            hdiag: vec![0.0; npt],
-        }
+    pub(crate) fn new(n: usize, npt: usize) -> Result<Self, TryReserveError> {
+        Ok(Self {
+            wcheck: try_vec(0.0, npt)?,
+            xrefxpt: try_vec(0.0, npt)?,
+            xz: try_vec(0.0, npt - n - 1)?,
+            omega: try_vec(0.0, npt)?,
+            wmv: try_vec(0.0, npt + n)?,
+            vlag_beta: try_vec(0.0, npt + n)?,
+            vlag_den: try_vec(0.0, npt + n)?,
+            hdiag: try_vec(0.0, npt)?,
+        })
     }
 }
 
@@ -507,7 +512,7 @@ mod tests {
         let xpt = Mat::from_col_major(n, npt, vec![1.0, 2.0, 0.0]);
         let zmat = Mat::from_col_major(npt, npt - n - 1, vec![1.0, 0.0, -1.0]);
         let d = [1.0];
-        let mut cw = CalWs::new(n, npt);
+        let mut cw = CalWs::new(n, npt).unwrap();
         let mut den_calden = vec![0.0; npt];
         calden_into(kref, &bmat, &d, &xpt, &zmat, &mut cw, &mut den_calden);
         let mut den_fused = vec![0.0; npt];

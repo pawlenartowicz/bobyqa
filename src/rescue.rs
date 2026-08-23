@@ -12,7 +12,11 @@ use crate::linalg::{inprod, matprod12_into, matprod21_into, planerot};
 use crate::mat::Mat;
 use crate::math;
 use crate::powalg::{hess_mul_into, setij_into};
-use crate::util::{checkexit, evaluate, xinbd_into};
+use crate::util::{checkexit, evaluate, try_capacity, try_vec, xinbd_into};
+use alloc::collections::TryReserveError;
+#[cfg(test)]
+use alloc::vec;
+use alloc::vec::Vec;
 
 /// Reused scratch for `updateh_rsc` — its per-call locals (VLAG copy, HCOL, V1, V2), hoisted
 /// like the [`RescueWs`] fields. Split out so `rescue` can pass its own `vlag` field (read-only)
@@ -68,40 +72,40 @@ pub(crate) struct RescueWs {
 }
 
 impl RescueWs {
-    pub(crate) fn new(n: usize, npt: usize) -> Self {
-        Self {
-            xopt: vec![0.0; n],
-            v: vec![0.0; n],
-            ptsaux1: vec![0.0; n],
-            ptsaux2: vec![0.0; n],
-            ptsid: vec![0.0; npt],
-            ij: Vec::with_capacity(npt.saturating_sub(2 * n + 1)),
-            score: vec![0.0; npt],
-            vlag: vec![0.0; npt + n],
-            wmv: vec![0.0; npt + n],
-            wmv_z: vec![0.0; npt - n - 1],
-            z_wmv_z: vec![0.0; npt],
-            bmat_wmv: vec![0.0; n],
-            t: vec![0.0; n],
-            den: vec![0.0; npt],
-            xnew: vec![0.0; n],
-            x: vec![0.0; n],
-            xmod: vec![0.0; n],
-            xxpt: vec![0.0; npt],
-            pq_xxpt: vec![0.0; npt],
-            zrow: vec![0.0; npt - n - 1],
-            z_zrow: vec![0.0; npt],
-            pqinc: vec![0.0; npt],
-            xpt_col: vec![0.0; n],
-            shift: vec![0.0; n],
-            dxpt: vec![0.0; npt],
+    pub(crate) fn new(n: usize, npt: usize) -> Result<Self, TryReserveError> {
+        Ok(Self {
+            xopt: try_vec(0.0, n)?,
+            v: try_vec(0.0, n)?,
+            ptsaux1: try_vec(0.0, n)?,
+            ptsaux2: try_vec(0.0, n)?,
+            ptsid: try_vec(0.0, npt)?,
+            ij: try_capacity(npt.saturating_sub(2 * n + 1))?,
+            score: try_vec(0.0, npt)?,
+            vlag: try_vec(0.0, npt + n)?,
+            wmv: try_vec(0.0, npt + n)?,
+            wmv_z: try_vec(0.0, npt - n - 1)?,
+            z_wmv_z: try_vec(0.0, npt)?,
+            bmat_wmv: try_vec(0.0, n)?,
+            t: try_vec(0.0, n)?,
+            den: try_vec(0.0, npt)?,
+            xnew: try_vec(0.0, n)?,
+            x: try_vec(0.0, n)?,
+            xmod: try_vec(0.0, n)?,
+            xxpt: try_vec(0.0, npt)?,
+            pq_xxpt: try_vec(0.0, npt)?,
+            zrow: try_vec(0.0, npt - n - 1)?,
+            z_zrow: try_vec(0.0, npt)?,
+            pqinc: try_vec(0.0, npt)?,
+            xpt_col: try_vec(0.0, n)?,
+            shift: try_vec(0.0, n)?,
+            dxpt: try_vec(0.0, npt)?,
             rsc: UpdatehRscWs {
-                vlag: vec![0.0; npt + n],
-                hcol: vec![0.0; npt + n],
-                v1: vec![0.0; n],
-                v2: vec![0.0; n],
+                vlag: try_vec(0.0, npt + n)?,
+                hcol: try_vec(0.0, npt + n)?,
+                v1: try_vec(0.0, n)?,
+                v2: try_vec(0.0, n)?,
             },
-        }
+        })
     }
 }
 
@@ -217,7 +221,7 @@ pub(crate) fn rescue<F: FnMut(&[f64]) -> f64>(
     // PRIMA L257-258: swap rows where ptsaux1 + ptsaux2 < 0.
     for i in 0..n {
         if ptsaux1[i] + ptsaux2[i] < 0.0 {
-            std::mem::swap(&mut ptsaux1[i], &mut ptsaux2[i]);
+            core::mem::swap(&mut ptsaux1[i], &mut ptsaux2[i]);
         }
     }
     // PRIMA L259-260: where |ptsaux2| < HALF*|ptsaux1|, set ptsaux2 = HALF*ptsaux1.
@@ -787,7 +791,7 @@ mod tests {
             let (mut sl, mut su, mut xbase) = (e.vec("sl"), e.vec("su"), e.vec("xbase"));
             let (mut hq, mut xpt) = (e.mat("hq"), e.mat("xpt"));
             let (mut bmat, mut zmat) = (e.mat("bmat"), e.mat("zmat"));
-            let mut ws = RescueWs::new(xpt.nrows(), xpt.ncols());
+            let mut ws = RescueWs::new(xpt.nrows(), xpt.ncols()).unwrap();
             let info = rescue(
                 &mut |p: &[f64]| f(p),
                 e.usize("maxfun"),
@@ -839,7 +843,7 @@ mod tests {
         let mut pq = vec![0.0; npt];
         let mut bmat = Mat::from_col_major(n, npt + n, vec![1.0; n * (npt + n)]);
         let mut zmat = Mat::from_col_major(npt, npt - n - 1, vec![1.0; npt * (npt - n - 1)]);
-        let mut ws = RescueWs::new(n, npt);
+        let mut ws = RescueWs::new(n, npt).unwrap();
         let info = rescue(
             &mut |_: &[f64]| 0.0,
             10,

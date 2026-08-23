@@ -5,6 +5,65 @@ All notable changes to this crate are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] — 2026-08-19
+
+A default-features build with a default `Config` is unchanged by this release: std math, the
+`std::error::Error` impl on `Status`, zero dependencies, and bit-exact `(x, f)` trajectories
+against the PRIMA goldens.
+
+### Added
+
+- **Opt-in f-tolerance stopping** (ftol spec): `Config::ftol_rel` / `Config::ftol_abs`
+  (both default `None`: off, bit-exact PRIMA). Stop when the best f improves by less than
+  `ftol_rel * max(|f_best|, 1) + ftol_abs` over one full rho stage — checked only at the
+  rho-reduction site, never during the first stage, never once `rho` reaches `rho_end`.
+  A triggered stop returns the new `Status::FtolReached`, a converged-class outcome that
+  does not spend a `Config::restart` cycle (ftol wins when both would fire at the same
+  reduction).
+- **Fallible workspace allocation** (safe-checks spec S2): every construction-time buffer
+  now allocates via `try_reserve_exact`; an allocation the platform cannot satisfy returns
+  the new `Status::AllocationFailed` from `Bobyqa::new` instead of aborting the process
+  (previously `vec![]` aborted — fatal on `no_std`/embedded). The warm path was and stays
+  allocation-free (`tests/alloc.rs`). `Bobyqa::new`'s docs now state the workspace size
+  formula so callers on big problems can budget.
+- **Workspace-size overflow gate** (safe-checks spec S1): `Bobyqa::new` validates every
+  derived dimension sum/product with checked arithmetic before sizing anything, rejecting
+  as `InvalidArgs` any `(n, npt)` whose buffer sizes would overflow `usize`. Previously
+  debug builds panicked (contradicting the "Panics: never" docs) and release builds
+  wrapped — on 32-bit targets (wasm32, thumbv7em) a wrapped size could stay in-bounds and
+  return garbage silently. `Config::new`'s derived `npt`/`max_fun` now saturate instead of
+  wrapping on absurd `n`. Adversarial-pair unit tests plus a
+  `#[cfg(target_pointer_width = "32")]` rejection test that CI's wasm32 job executes.
+- **`MAX_RESTARTS_CAP`** (= 10 000): `RestartConfig::max_restarts` above it is rejected,
+  closing both a `+ 1` overflow and a caller-sized giant allocation of the per-cycle
+  boundary store (safe-checks spec S2).
+- **Hardening tests** (safe-checks spec S3): reuse after an objective panic reproduces a
+  clean solver's trajectory bit-for-bit (`tests/safety.rs` pins the documented
+  "re-initializes whatever it reads" contract), and `f_target = +inf` — which would
+  "succeed" on the first evaluation — is now rejected like NaN.
+
+- **`no_std` + `alloc` support.** The crate is now `#![no_std]`: it needs an allocator
+  (`Bobyqa::new` still allocates once per problem size; `minimize` still allocates zero) but
+  not an operating system. `no_std` consumers build with
+  `default-features = false, features = ["libm"]`.
+- **`std` cargo feature** (default-on) — gates the `std::error::Error` impl on `Status`;
+  `Status` keeps `Display` without it. Nothing else.
+- **`libm` cargo feature** — backs the math seam (`sqrt`/`floor`/`round`) with the optional
+  [`libm`](https://crates.io/crates/libm) dependency instead of std intrinsics. Orthogonal to
+  `std`: CI runs the full bit-exact parity battery with both on, so the libm backend is held
+  to the same goldens as the default build. With neither feature on, the crate fails to
+  compile with one clear `compile_error!` message.
+- **CI gates**: the full battery on `--features libm`, and a
+  `--no-default-features --features libm` build for the bare-metal `thumbv7em-none-eabihf`
+  target, beside the existing wasm gates.
+
+### Changed
+
+- The two `powi` calls in the `norm` overflow rescue became consts (`2^-1022`/`2^1022`, both
+  exact powers of two; a unit test pins them bit-for-bit to the original expressions), and one
+  `f64::round` call site moved onto the math seam. Bit-exact no-ops, verified against the
+  golden battery in isolation.
+
 ## [0.2.0] — 2026-07-31
 
 With `restart: None` — the default — `Bobyqa` is unchanged by this release: its trust-region

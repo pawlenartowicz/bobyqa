@@ -10,6 +10,11 @@ use crate::linalg::{inprod, matprod12_into, matprod21_into, planerot, r1update};
 use crate::mat::Mat;
 use crate::math;
 use crate::powalg::{CalWs, calbeta, calvlag_into, hess_mul_into};
+use crate::util::try_vec;
+use alloc::collections::TryReserveError;
+#[cfg(test)]
+use alloc::vec;
+use alloc::vec::Vec;
 
 /// Reused scratch for the update.f90 routines — PRIMA's per-call locals, hoisted to the solver
 /// workspace (rust.md §4). Lifetime and contents per call are identical to the Fortran locals;
@@ -40,24 +45,24 @@ pub(crate) struct UpdateWs {
 }
 
 impl UpdateWs {
-    pub(crate) fn new(n: usize, npt: usize) -> Self {
-        Self {
-            zrow: vec![0.0; npt - n - 1],
-            hcol: vec![0.0; npt + n],
-            vlag: vec![0.0; npt + n],
-            v1: vec![0.0; n],
-            v2: vec![0.0; n],
-            pqinc: vec![0.0; npt],
-            zmat_zrow: vec![0.0; npt],
-            hm: vec![0.0; n],
-            pgopt: vec![0.0; n],
-            inner: vec![0.0; npt - n - 1],
-            pqalt: vec![0.0; npt],
-            galt: vec![0.0; n],
-            pgalt: vec![0.0; n],
-            dxpt: vec![0.0; npt],
-            cal: CalWs::new(n, npt),
-        }
+    pub(crate) fn new(n: usize, npt: usize) -> Result<Self, TryReserveError> {
+        Ok(Self {
+            zrow: try_vec(0.0, npt - n - 1)?,
+            hcol: try_vec(0.0, npt + n)?,
+            vlag: try_vec(0.0, npt + n)?,
+            v1: try_vec(0.0, n)?,
+            v2: try_vec(0.0, n)?,
+            pqinc: try_vec(0.0, npt)?,
+            zmat_zrow: try_vec(0.0, npt)?,
+            hm: try_vec(0.0, n)?,
+            pgopt: try_vec(0.0, n)?,
+            inner: try_vec(0.0, npt - n - 1)?,
+            pqalt: try_vec(0.0, npt)?,
+            galt: try_vec(0.0, n)?,
+            pgalt: try_vec(0.0, n)?,
+            dxpt: try_vec(0.0, npt)?,
+            cal: CalWs::new(n, npt)?,
+        })
     }
 }
 
@@ -132,10 +137,17 @@ pub(crate) fn updateh(
         return DAMAGING_ROUNDING;
     }
 
-    // PRIMA update.f90 L146-147: V1 and V2.
-    for i in 0..n {
-        v1[i] = (alpha * vlag[npt + i] - tau * hcol[npt + i]) / denom;
-        v2[i] = (-beta * hcol[npt + i] - tau * vlag[npt + i]) / denom;
+    // PRIMA update.f90 L146-147: V1 and V2. Tail reslices: bounds-check-free lanes, same
+    // per-element arithmetic in the same order.
+    {
+        let vlag_tail = &vlag[npt..npt + n];
+        let hcol_tail = &hcol[npt..npt + n];
+        let v1 = &mut v1[..n];
+        let v2 = &mut v2[..n];
+        for i in 0..n {
+            v1[i] = (alpha * vlag_tail[i] - tau * hcol_tail[i]) / denom;
+            v2[i] = (-beta * hcol_tail[i] - tau * vlag_tail[i]) / denom;
+        }
     }
 
     // PRIMA update.f90 L148: BMAT = BMAT + OUTPROD(V1, VLAG) + OUTPROD(V2, HCOL).
@@ -302,8 +314,10 @@ pub(crate) fn updateq(
     // first GOPT += MODERR*BMAT(:, KNEW), then GOPT += HESS_MUL(...).
     hess_mul_into(xosav, xpt, pqinc, None, dxpt, hm);
     let n = gopt.len();
+    // Column-slice access: same per-element adds in the same order.
+    let bk = &bmat.col(knew)[..n];
     for i in 0..n {
-        gopt[i] += moderr * bmat[[i, knew]];
+        gopt[i] += moderr * bk[i];
     }
     for i in 0..n {
         gopt[i] += hm[i];
@@ -323,6 +337,7 @@ pub(crate) fn updateq(
 /// interpolant; replace (gopt ← galt, pq ← pqalt, hq ← 0, itest ← 0) when `itest` reaches 3.
 #[expect(clippy::too_many_arguments)] // out-params mirror the Fortran intent (rust.md §5)
 #[expect(clippy::similar_names)] // xopt/xpt and pqalt/pgalt are PRIMA identifiers (rust.md §5)
+#[expect(clippy::needless_range_loop)] // explicit indexed loops mirror PRIMA (rust.md §5)
 pub(crate) fn tryqalt(
     bmat: &Mat,
     fval: &[f64],
@@ -376,10 +391,15 @@ pub(crate) fn tryqalt(
     // PRIMA update.f90 L464: GALT = MATPROD(BMAT(:, 1:NPT), FVAL) + HESS_MUL(XOPT, XPT, PQALT).
     // Section product: explicit column-outer loop over j in 0..npt (mirrors matprod21 order).
     galt.fill(0.0);
-    for j in 0..npt {
-        let fvalj = fval[j];
-        for i in 0..n {
-            galt[i] += bmat[[i, j]] * fvalj;
+    {
+        // Column-slice access: same j-outer/i-ascending accumulation, bounds-check-free.
+        let galt = &mut galt[..n];
+        for j in 0..npt {
+            let fvalj = fval[j];
+            let bj = &bmat.col(j)[..n];
+            for i in 0..n {
+                galt[i] += bj[i] * fvalj;
+            }
         }
     }
     hess_mul_into(xopt, xpt, pqalt, None, dxpt, hm);
@@ -445,7 +465,7 @@ mod tests {
             let mut zmat = e.mat("zmat");
             // No `info` diff: the bobyqb.f90 call site on this pin omits the optional INFO
             // (oracle/README.md, Instrumentation).
-            let mut ws = UpdateWs::new(xpt.nrows(), xpt.ncols());
+            let mut ws = UpdateWs::new(xpt.nrows(), xpt.ncols()).unwrap();
             let _info = updateh(knew, kopt, &d, &xpt, &mut bmat, &mut zmat, &mut ws, None);
             stats.mat("bmat", &bmat, &x.mat("bmat"));
             stats.mat("zmat", &zmat, &x.mat("zmat"));
@@ -502,7 +522,7 @@ mod tests {
             let mut gopt = e.vec("gopt");
             let mut hq = e.mat("hq");
             let mut pq = e.vec("pq");
-            let mut ws = UpdateWs::new(xpt.nrows(), xpt.ncols());
+            let mut ws = UpdateWs::new(xpt.nrows(), xpt.ncols()).unwrap();
             updateq(
                 knew, ximproved, &bmat, &d, moderr, &xdrop, &xosav, &xpt, &zmat, &mut gopt,
                 &mut hq, &mut pq, &mut ws,
@@ -534,7 +554,7 @@ mod tests {
             let mut gopt = e.vec("gopt");
             let mut hq = e.mat("hq");
             let mut pq = e.vec("pq");
-            let mut ws = UpdateWs::new(xpt.nrows(), xpt.ncols());
+            let mut ws = UpdateWs::new(xpt.nrows(), xpt.ncols()).unwrap();
             tryqalt(
                 &bmat, &fval, ratio, &sl, &su, &xopt, &xpt, &zmat, &mut itest, &mut gopt, &mut hq,
                 &mut pq, &mut ws,
@@ -563,7 +583,7 @@ mod tests {
         let mut bmat = Mat::from_col_major(1, 5, vec![1.0, 2.0, 3.0, 4.0, 5.0]);
         let mut zmat = Mat::from_col_major(4, 2, (0..8).map(f64::from).collect());
         let (b0, z0) = (bmat.data().to_vec(), zmat.data().to_vec());
-        let mut ws = UpdateWs::new(xpt.nrows(), xpt.ncols());
+        let mut ws = UpdateWs::new(xpt.nrows(), xpt.ncols()).unwrap();
         let info = updateh(None, 0, &[0.0], &xpt, &mut bmat, &mut zmat, &mut ws, None);
         assert_eq!(info, crate::consts::INFO_DFT);
         assert_eq!(bmat.data(), &b0[..]);
@@ -607,7 +627,7 @@ mod tests {
         let mut hq = Mat::from_col_major(1, 1, vec![7.0]);
         let mut pq = vec![1.0, 2.0, 3.0, 4.0];
         let (g0, h0, p0) = (gopt.clone(), hq.data().to_vec(), pq.clone());
-        let mut ws = UpdateWs::new(n, npt);
+        let mut ws = UpdateWs::new(n, npt).unwrap();
         updateq(
             None,
             true,
@@ -644,7 +664,7 @@ mod tests {
         let mut gopt = vec![5.0];
         let mut hq = Mat::from_col_major(1, 1, vec![7.0]);
         let mut pq = vec![1.0; npt];
-        let mut ws = UpdateWs::new(n, npt);
+        let mut ws = UpdateWs::new(n, npt).unwrap();
         tryqalt(
             &bmat, &fval, 0.0, &sl, &su, &xopt, &xpt, &zmat, &mut itest, &mut gopt, &mut hq,
             &mut pq, &mut ws,
@@ -672,7 +692,7 @@ mod tests {
         let mut gopt = vec![5.0];
         let mut hq = Mat::from_col_major(1, 1, vec![7.0]);
         let mut pq = vec![1.0; npt];
-        let mut ws = UpdateWs::new(n, npt);
+        let mut ws = UpdateWs::new(n, npt).unwrap();
         tryqalt(
             &bmat, &fval, 0.5, &sl, &su, &xopt, &xpt, &zmat, &mut itest, &mut gopt, &mut hq,
             &mut pq, &mut ws,

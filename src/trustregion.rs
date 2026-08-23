@@ -11,7 +11,11 @@ use crate::linalg::inprod;
 use crate::mat::Mat;
 use crate::math;
 use crate::powalg::hess_mul_into;
-use crate::util::interval_max;
+use crate::util::{interval_max, try_vec};
+use alloc::collections::TryReserveError;
+#[cfg(test)]
+use alloc::vec;
+use alloc::vec::Vec;
 
 /// `interval_max`'s largest grid: `GRID_SIZE` = 2*nint(17*`HANGT_BD` + 4.1) (trustregion.f90
 /// L526) with `HANGT_BD` in (0, 1] (TANBD starts at ONE and is only ever min-reduced), so at
@@ -50,28 +54,28 @@ pub(crate) struct TrsboxWs {
 }
 
 impl TrsboxWs {
-    pub(crate) fn new(n: usize, npt: usize) -> Self {
-        Self {
-            gopt: vec![0.0; n],
-            pq: vec![0.0; npt],
-            hq: Mat::zeros(n, n),
-            xbdi: vec![0; n],
-            gnew: vec![0.0; n],
-            s: vec![0.0; n],
-            xnew: vec![0.0; n],
-            xtest: vec![0.0; n],
-            sbound: vec![0.0; n],
-            dold: vec![0.0; n],
-            hdred: vec![0.0; n],
-            dred: vec![0.0; n],
-            ssq: vec![0.0; n],
-            tanbd: vec![0.0; n],
-            sqdscr: vec![0.0; n],
-            hs: vec![0.0; n],
-            dxpt: vec![0.0; npt],
-            xgrid: vec![0.0; GRID_SIZE_MAX],
-            fgrid: vec![0.0; GRID_SIZE_MAX],
-        }
+    pub(crate) fn new(n: usize, npt: usize) -> Result<Self, TryReserveError> {
+        Ok(Self {
+            gopt: try_vec(0.0, n)?,
+            pq: try_vec(0.0, npt)?,
+            hq: Mat::try_zeros(n, n)?,
+            xbdi: try_vec(0, n)?,
+            gnew: try_vec(0.0, n)?,
+            s: try_vec(0.0, n)?,
+            xnew: try_vec(0.0, n)?,
+            xtest: try_vec(0.0, n)?,
+            sbound: try_vec(0.0, n)?,
+            dold: try_vec(0.0, n)?,
+            hdred: try_vec(0.0, n)?,
+            dred: try_vec(0.0, n)?,
+            ssq: try_vec(0.0, n)?,
+            tanbd: try_vec(0.0, n)?,
+            sqdscr: try_vec(0.0, n)?,
+            hs: try_vec(0.0, n)?,
+            dxpt: try_vec(0.0, npt)?,
+            xgrid: try_vec(0.0, GRID_SIZE_MAX)?,
+            fgrid: try_vec(0.0, GRID_SIZE_MAX)?,
+        })
     }
 }
 
@@ -127,11 +131,33 @@ pub(crate) fn trsbox(
         fgrid,
     } = ws;
 
+    // Length-equalized reslices (bounds-check elision only — same arithmetic in the same
+    // order): every n-length buffer is pinned to `n` once, so the `0..n` loops below index
+    // checked-free.
+    let gopt = &mut gopt[..n];
+    let xbdi = &mut xbdi[..n];
+    let gnew = &mut gnew[..n];
+    let s = &mut s[..n];
+    let xnew = &mut xnew[..n];
+    let xtest = &mut xtest[..n];
+    let sbound = &mut sbound[..n];
+    let dold = &mut dold[..n];
+    let hdred = &mut hdred[..n];
+    let dred = &mut dred[..n];
+    let ssq = &mut ssq[..n];
+    let tanbd = &mut tanbd[..n];
+    let sqdscr = &mut sqdscr[..n];
+    let hs = &mut hs[..n];
+    let d = &mut d[..n];
+    let sl = &sl[..n];
+    let su = &su[..n];
+    let xopt = &xopt[..n];
+
     // PRIMA trustregion.f90 L168-180: scale the problem if GOPT contains large values (else FP
     // exceptions may occur). CRVMIN must be scaled back if nonzero; the step is scale invariant.
     let max_abs_gopt = gopt_in.iter().fold(0.0_f64, |m, &v| m.max(math::abs(v)));
     let (scaled, modscal): (bool, f64);
-    if max_abs_gopt > 1.0e12 {
+    let (gopt, pq, hq): (&[f64], &[f64], &Mat) = if max_abs_gopt > 1.0e12 {
         // PRIMA L169: MAX is a precaution against underflow.
         let ms = (2.0 * REALMIN).max(1.0 / max_abs_gopt);
         for i in 0..n {
@@ -148,14 +174,15 @@ pub(crate) fn trsbox(
         }
         scaled = true;
         modscal = ms;
+        (&*gopt, &pq[..], &*hq)
     } else {
         // PRIMA L175: MODSCAL is unused here but set to entertain Fortran compilers.
-        gopt.copy_from_slice(gopt_in);
-        pq.copy_from_slice(pq_in);
-        hq.copy_from(hq_in);
+        // GOPT/PQ/HQ are pure copies of the inputs on this branch and are never mutated
+        // afterwards — read the inputs directly (bit-identical values, three memcpys elided).
         scaled = false;
         modscal = 1.0;
-    }
+        (gopt_in, pq_in, hq_in)
+    };
 
     // PRIMA L184-186: IACT/DREDSQ/GGSAV initial values are unused but entertain the compiler. In
     // Rust `iact` is assigned before each read inside both loops, so it carries no initial value.
@@ -202,8 +229,9 @@ pub(crate) fn trsbox(
     debug_assert!(nact <= n, "nact counts at-bound variables of n total");
     let mut maxiter = (10_000).min((n - nact) * (n - nact));
 
-    // PRIMA L223-395: the truncated CG loop.
-    s.fill(0.0);
+    // PRIMA L223-395: the truncated CG loop. (S needs no zeroing: the first CG pass runs with
+    // ITERCG == 0 and writes every S(I), and the 2-D search below fully rewrites S before any
+    // read — the Fortran's fresh-allocation zero is a dead store here.)
     for _iter in 0..maxiter {
         // PRIMA L224-228: RESID = DELSQ - sum of squares of the free D; RESID <= 0 => boundary.
         let resid = delsq - masked_sumsq(d, xbdi);
@@ -256,7 +284,7 @@ pub(crate) fn trsbox(
         }
 
         // PRIMA L272-277: HS, SHS, STPLEN.
-        hess_mul_into(s, xpt, pq, Some(&*hq), dxpt, hs);
+        hess_mul_into(s, xpt, pq, Some(hq), dxpt, hs);
         let shs = masked_inprod(s, hs, xbdi);
         let mut stplen = bstep;
         if shs > 0.0 {
@@ -392,8 +420,9 @@ pub(crate) fn trsbox(
 
     // PRIMA L424-557: improve D by a sequential 2-D search on the trust-region boundary for the
     // variables that have not reached a bound.
+    // HDRED needs no zeroing: the ITER1 == 1 arm of the L440-444 branch always runs on the first
+    // pass and `hess_mul_into` fully overwrites HDRED before its first read — a dead store.
     let mut nactsav: isize = nact as isize - 1;
-    hdred.fill(0.0);
     for iter1 in 1..=maxiter {
         for i in 0..n {
             xnew[i] = xopt[i] + d[i];
@@ -427,7 +456,7 @@ pub(crate) fn trsbox(
                     dred[i] = 0.0;
                 }
             }
-            hess_mul_into(dred, xpt, pq, Some(&*hq), dxpt, hdred);
+            hess_mul_into(dred, xpt, pq, Some(hq), dxpt, hdred);
             nactsav = nact as isize;
         }
 
@@ -449,9 +478,9 @@ pub(crate) fn trsbox(
         }
         let sredg = -temp;
 
-        // PRIMA L474-482: TANBD block, in exact source order. SSQ; TANBD = 1; the two WHERE pairs
-        // (SL then SU), with SQDSCR reset to -REALMAX between them; NaN -> 0.
-        ssq.fill(0.0);
+        // PRIMA L474-482: TANBD block, in exact source order. SSQ (full overwrite — no zeroing
+        // needed); TANBD = 1; the two WHERE pairs (SL then SU), with SQDSCR reset to -REALMAX
+        // between them; NaN -> 0.
         for i in 0..n {
             ssq[i] = d[i] * d[i] + s[i] * s[i];
         }
@@ -504,7 +533,7 @@ pub(crate) fn trsbox(
         }
 
         // PRIMA L511-514: HS and curvatures for the alternative iteration.
-        hess_mul_into(s, xpt, pq, Some(&*hq), dxpt, hs);
+        hess_mul_into(s, xpt, pq, Some(hq), dxpt, hs);
         let shs = masked_inprod(s, hs, xbdi);
         let dhs = masked_inprod(d, hs, xbdi);
         let dhd = masked_inprod(d, hdred, xbdi);
@@ -514,9 +543,9 @@ pub(crate) fn trsbox(
         if args.iter().any(|v| v.is_nan()) {
             break;
         }
-        // PRIMA L526: GRID_SIZE = 2 * nint(17*HANGT_BD + 4.1). HANGT_BD > 0 here, so f64::round
+        // PRIMA L526: GRID_SIZE = 2 * nint(17*HANGT_BD + 4.1). HANGT_BD > 0 here, so f64 round
         // (half away from zero) matches Fortran nint.
-        let grid_size = 2 * ((17.0 * hangt_bd + 4.1).round() as usize);
+        let grid_size = 2 * (math::round(17.0 * hangt_bd + 4.1) as usize);
         debug_assert!(
             grid_size <= GRID_SIZE_MAX,
             "interval_max grid over capacity"
@@ -655,7 +684,10 @@ pub(crate) fn trrad(
 
 /// PRIMA `sum(x(trueloc(xbdi == 0))**2)`: ascending masked sum of squares over the free variables,
 /// in the same FP order as Fortran's gather-then-sum.
+#[inline]
 fn masked_sumsq(x: &[f64], xbdi: &[i32]) -> f64 {
+    // Length-equalized reslice: bounds-check-free mask reads, same ascending accumulation.
+    let xbdi = &xbdi[..x.len()];
     let mut acc = 0.0;
     for i in 0..x.len() {
         if xbdi[i] == 0 {
@@ -667,7 +699,11 @@ fn masked_sumsq(x: &[f64], xbdi: &[i32]) -> f64 {
 
 /// PRIMA `inprod(x(trueloc(xbdi == 0)), y(trueloc(xbdi == 0)))`: ascending masked inner product
 /// over the free variables.
+#[inline]
 fn masked_inprod(x: &[f64], y: &[f64], xbdi: &[i32]) -> f64 {
+    // Length-equalized reslices: bounds-check-free lanes, same ascending accumulation.
+    let y = &y[..x.len()];
+    let xbdi = &xbdi[..x.len()];
     let mut acc = 0.0;
     for i in 0..x.len() {
         if xbdi[i] == 0 {
@@ -719,7 +755,7 @@ mod tests {
             let (hq_in, xpt) = (e.mat("hq_in"), e.mat("xpt"));
             let (sl, su, xopt) = (e.vec("sl"), e.vec("su"), e.vec("xopt"));
             let mut d = vec![0.0; gopt_in.len()];
-            let mut ws = TrsboxWs::new(gopt_in.len(), pq_in.len());
+            let mut ws = TrsboxWs::new(gopt_in.len(), pq_in.len()).unwrap();
             let crvmin = trsbox(
                 e.f64("delta"),
                 &gopt_in,
@@ -771,7 +807,7 @@ mod tests {
         hq[[1, 1]] = 1.0;
         let (sl, su) = (vec![-10.0; n], vec![10.0; n]);
         let mut d = vec![0.0; n];
-        let mut ws = TrsboxWs::new(n, npt);
+        let mut ws = TrsboxWs::new(n, npt).unwrap();
         let crvmin = trsbox(
             5.0,
             &[1.0, 0.5],
@@ -802,7 +838,7 @@ mod tests {
         hq[[1, 1]] = 1.0;
         let (sl, su) = (vec![-10.0; n], vec![0.0, 10.0]); // su[0] = 0 = xopt[0]
         let mut d = vec![0.0; n];
-        let mut ws = TrsboxWs::new(n, npt);
+        let mut ws = TrsboxWs::new(n, npt).unwrap();
         let _ = trsbox(
             5.0,
             &[-1.0, 1.0],

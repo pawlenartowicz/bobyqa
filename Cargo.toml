@@ -1,10 +1,10 @@
 [package]
 name = "bobyqa"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.85"
 authors = ["Paweł Lenartowicz <pawellenartowicz@europe.com>"]
-description = "Dependency-free BOBYQA: derivative-free minimization of a box-constrained function from values alone — a faithful pure-Rust port of PRIMA."
+description = "Dependency-free-by-default, no_std-compatible BOBYQA: derivative-free minimization of a box-constrained function from values alone — a faithful pure-Rust port of PRIMA."
 repository = "https://github.com/pawlenartowicz/bobyqa"
 documentation = "https://docs.rs/bobyqa"
 readme = "README.md"
@@ -15,8 +15,12 @@ categories = ["mathematics", "science", "algorithms"]
 # they live in git for CI but are not shipped to downstream users.
 exclude = ["tests/"]
 
-# Zero runtime dependencies: the golden parser is hand-rolled, and the bit-exact parity
-# discipline never needed `approx`.
+# Zero runtime dependencies by default: the golden parser is hand-rolled, and the bit-exact
+# parity discipline never needed `approx`. The one optional dependency, `libm`, is pulled in
+# only by the `libm` feature (the no_std math backend).
+
+[dependencies]
+libm = { version = "0.2", optional = true }
 
 # Dev-only: criterion drives benches/solver.rs, the warm-path per-call cost bench behind
 # every optimization adoption decision. Dev-dependencies never reach downstream users.
@@ -33,6 +37,13 @@ harness = false
 # `unsafe impl GlobalAlloc`.
 
 [features]
+default = ["std"]
+# Gates `impl std::error::Error for Status`. Nothing else. Turn it off (with `libm` on)
+# for no_std builds; `Status` keeps `Display` either way.
+std = []
+# Backs the src/math.rs seam with `libm` instead of std intrinsics — the no_std math
+# backend. Composes with `std` (that combination is CI's bit-exact parity gate).
+libm = ["dep:libm"]
 # Dev-only kernel-invocation counter. OFF by default: the shipped library has no global
 # mutable state. Mirrors tests/alloc.rs's dev-only shim.
 count-kernels = []

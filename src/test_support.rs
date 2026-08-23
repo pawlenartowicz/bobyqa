@@ -4,6 +4,9 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+use std::string::{String, ToString};
+use std::vec::Vec;
+use std::{eprintln, format, vec};
 
 use crate::mat::Mat;
 

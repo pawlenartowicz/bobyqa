@@ -10,6 +10,11 @@ use crate::linalg::{inprod, matprod12_into, matprod21_into, norm};
 use crate::mat::Mat;
 use crate::math;
 use crate::powalg::{CalWs, calden_into, hess_mul_into};
+use crate::util::try_vec;
+use alloc::collections::TryReserveError;
+#[cfg(test)]
+use alloc::vec;
+use alloc::vec::Vec;
 
 /// Reused scratch for the geometry.f90 routines (`setdrop_tr` and `geostep`) — PRIMA's per-call
 /// locals, hoisted to the solver workspace (the crate-`//!` zero-alloc warm path); each field is
@@ -61,44 +66,44 @@ pub(crate) struct GeostepWs {
 }
 
 impl GeostepWs {
-    pub(crate) fn new(n: usize, npt: usize) -> Self {
-        Self {
-            distsq: vec![0.0; npt],
-            weight: vec![0.0; npt],
-            den: vec![0.0; npt],
-            score: vec![0.0; npt],
-            zrow_knew: vec![0.0; npt - n - 1],
-            pqlag: vec![0.0; npt],
-            xopt: vec![0.0; n],
-            hm: vec![0.0; n],
-            glag: vec![0.0; n],
-            dderiv: vec![0.0; npt],
-            stplen: Mat::zeros(3, npt),
-            isbd: vec![[0; 3]; npt],
-            xdiff: vec![0.0; n],
-            lfrac: vec![0.0; n],
-            ufrac: vec![0.0; n],
-            slbd_test: vec![0.0; n],
-            subd_test: vec![0.0; n],
-            vlag: Mat::zeros(3, npt),
-            betabd: Mat::zeros(3, npt),
-            predsq: Mat::zeros(3, npt),
-            xline: vec![0.0; n],
-            den_line: vec![0.0; npt],
-            xcauchy: vec![0.0; n],
-            s: vec![0.0; n],
-            mask_free: vec![false; n],
-            xtemp: vec![0.0; n],
-            mask_fixl: vec![false; n],
-            mask_fixu: vec![false; n],
-            new_mask_free: vec![false; n],
-            x: vec![0.0; n],
-            sxpt: vec![0.0; npt],
-            s_cauchy: vec![0.0; n],
-            den_cauchy: vec![0.0; npt],
-            dxpt: vec![0.0; npt],
-            cal: CalWs::new(n, npt),
-        }
+    pub(crate) fn new(n: usize, npt: usize) -> Result<Self, TryReserveError> {
+        Ok(Self {
+            distsq: try_vec(0.0, npt)?,
+            weight: try_vec(0.0, npt)?,
+            den: try_vec(0.0, npt)?,
+            score: try_vec(0.0, npt)?,
+            zrow_knew: try_vec(0.0, npt - n - 1)?,
+            pqlag: try_vec(0.0, npt)?,
+            xopt: try_vec(0.0, n)?,
+            hm: try_vec(0.0, n)?,
+            glag: try_vec(0.0, n)?,
+            dderiv: try_vec(0.0, npt)?,
+            stplen: Mat::try_zeros(3, npt)?,
+            isbd: try_vec([0; 3], npt)?,
+            xdiff: try_vec(0.0, n)?,
+            lfrac: try_vec(0.0, n)?,
+            ufrac: try_vec(0.0, n)?,
+            slbd_test: try_vec(0.0, n)?,
+            subd_test: try_vec(0.0, n)?,
+            vlag: Mat::try_zeros(3, npt)?,
+            betabd: Mat::try_zeros(3, npt)?,
+            predsq: Mat::try_zeros(3, npt)?,
+            xline: try_vec(0.0, n)?,
+            den_line: try_vec(0.0, npt)?,
+            xcauchy: try_vec(0.0, n)?,
+            s: try_vec(0.0, n)?,
+            mask_free: try_vec(false, n)?,
+            xtemp: try_vec(0.0, n)?,
+            mask_fixl: try_vec(false, n)?,
+            mask_fixu: try_vec(false, n)?,
+            new_mask_free: try_vec(false, n)?,
+            x: try_vec(0.0, n)?,
+            sxpt: try_vec(0.0, npt)?,
+            s_cauchy: try_vec(0.0, n)?,
+            den_cauchy: try_vec(0.0, npt)?,
+            dxpt: try_vec(0.0, npt)?,
+            cal: CalWs::new(n, npt)?,
+        })
     }
 }
 
@@ -135,12 +140,16 @@ pub(crate) fn setdrop_tr(
 
     // PRIMA geometry.f90 L106–112: DISTSQ — distance squares from each XPT col to the "optimal
     // point", which is XOPT + D when ximproved (the new trial point), or XOPT alone otherwise.
+    // Column-slice access (same per-element ops in the same order, bounds-check-free).
+    let xko = &xpt.col(kopt)[..n];
     if ximproved {
         // PRIMA: distsq = sum((xpt - spread(xpt(:, kopt) + d, dim=2, ncopies=npt))**2, dim=1)
+        let d = &d[..n];
         for k in 0..npt {
+            let xk = &xpt.col(k)[..n];
             let mut sq = 0.0;
             for i in 0..n {
-                let diff = xpt[[i, k]] - (xpt[[i, kopt]] + d[i]);
+                let diff = xk[i] - (xko[i] + d[i]);
                 sq += diff * diff;
             }
             distsq[k] = sq;
@@ -148,9 +157,10 @@ pub(crate) fn setdrop_tr(
     } else {
         // PRIMA: distsq = sum((xpt - spread(xpt(:, kopt), dim=2, ncopies=npt))**2, dim=1)
         for k in 0..npt {
+            let xk = &xpt.col(k)[..n];
             let mut sq = 0.0;
             for i in 0..n {
-                let diff = xpt[[i, k]] - xpt[[i, kopt]];
+                let diff = xk[i] - xko[i];
                 sq += diff * diff;
             }
             distsq[k] = sq;
@@ -234,6 +244,7 @@ pub(crate) fn setdrop_tr(
 #[expect(clippy::cast_possible_wrap)] // isbd signed-1-based encoding: usize+1 fits i64 for realistic n — module header
 #[expect(clippy::cast_possible_truncation)] // sign(1.0, x) as i64: value is exactly ±1.0, no truncation — module header
 #[expect(clippy::cast_sign_loss)] // ibd→usize: always positive at use site (guarded by ibd<0/ibd>0) — module header
+#[expect(clippy::many_single_char_names)] // PRIMA's d/s/x plus their length-pinning reslice shadows
 pub(crate) fn geostep(
     knew: usize,
     kopt: usize,
@@ -285,6 +296,34 @@ pub(crate) fn geostep(
         ..
     } = ws;
 
+    // Length-equalized reslices (bounds-check elision only — same arithmetic in the same
+    // order): the n- and npt-length buffers are pinned to their lengths once, so the `0..n`/
+    // `0..npt` loops below index checked-free.
+    let xopt = &mut xopt[..n];
+    let glag = &mut glag[..n];
+    let xdiff = &mut xdiff[..n];
+    let lfrac = &mut lfrac[..n];
+    let ufrac = &mut ufrac[..n];
+    let slbd_test = &mut slbd_test[..n];
+    let subd_test = &mut subd_test[..n];
+    let xline = &mut xline[..n];
+    let xcauchy = &mut xcauchy[..n];
+    let s = &mut s[..n];
+    let mask_free = &mut mask_free[..n];
+    let xtemp = &mut xtemp[..n];
+    let mask_fixl = &mut mask_fixl[..n];
+    let mask_fixu = &mut mask_fixu[..n];
+    let new_mask_free = &mut new_mask_free[..n];
+    let x = &mut x[..n];
+    let s_cauchy = &mut s_cauchy[..n];
+    let d = &mut d[..n];
+    let sl = &sl[..n];
+    let su = &su[..n];
+    let distsq = &mut distsq[..npt];
+    let pqlag = &mut pqlag[..npt];
+    let dderiv = &mut dderiv[..npt];
+    let isbd = &mut isbd[..npt];
+
     // PRIMA geometry.f90 L302–303: pqlag = matprod(zmat, zmat(knew, :)); alpha = pqlag(knew).
     // PRIMA geometry.f90 L302: the zmat(knew, :) row extraction — a gather temp, since rows of
     // the column-major Mat are not contiguous (shared convention: row extraction).
@@ -327,7 +366,7 @@ pub(crate) fn geostep(
     }
 
     // PRIMA geometry.f90 L338: distsq = sum((xpt - spread(xopt, dim=2, ncopies=npt))**2, dim=1)
-    distsq.fill(0.0);
+    // (full overwrite — no zeroing needed).
     for k in 0..npt {
         // Column-slice access: same i-ascending accumulation per k.
         let xk = &xpt.col(k)[..n];
@@ -362,10 +401,8 @@ pub(crate) fn geostep(
         let mut iubd: i64 = 0;
         let sumin = (1.0_f64).min(subd_init); // PRIMA: sumin = min(ONE, subd)
 
-        // PRIMA geometry.f90 L365–369: xdiff, lfrac, ufrac
-        xdiff.fill(0.0);
-        lfrac.fill(0.0);
-        ufrac.fill(0.0);
+        // PRIMA geometry.f90 L365–369: xdiff, lfrac, ufrac — each entry is written
+        // unconditionally in the loop below before any read, so no per-k zeroing is needed.
         // Column-slice access — same per-element ops in the same order.
         let xk = &xpt.col(k)[..n];
         for i in 0..n {
@@ -460,10 +497,13 @@ pub(crate) fn geostep(
     // PRIMA geometry.f90 L428–443: compute vlag (3×npt), betabd (3×npt), predsq (3×npt)
 
     // PRIMA: vlag = stplen * (ONE - stplen) * spread(dderiv, dim=1, ncopies=3)
-    vlag.fill(0.0);
+    // (full overwrite — no zeroing needed). Column-slice access: same per-element ops in order.
     for k in 0..npt {
+        let sk = &stplen.col(k)[..3];
+        let vk = &mut vlag.col_mut(k)[..3];
+        let dd = dderiv[k];
         for i in 0..3 {
-            vlag[[i, k]] = stplen[[i, k]] * (1.0 - stplen[[i, k]]) * dderiv[k];
+            vk[i] = sk[i] * (1.0 - sk[i]) * dd;
         }
     }
     // PRIMA geometry.f90 L430: overwrite column knew
@@ -474,34 +514,40 @@ pub(crate) fn geostep(
     }
     // PRIMA geometry.f90 L433: where (is_nan(vlag)) vlag = ZERO
     for k in 0..npt {
+        let vk = &mut vlag.col_mut(k)[..3];
         for i in 0..3 {
-            if vlag[[i, k]].is_nan() {
-                vlag[[i, k]] = 0.0;
+            if vk[i].is_nan() {
+                vk[i] = 0.0;
             }
         }
     }
 
     // PRIMA geometry.f90 L436: betabd = HALF * (stplen * (ONE - stplen) * spread(distsq, …))**2
-    betabd.fill(0.0);
+    // (full overwrite — no zeroing needed). Column-slice access: same per-element ops in order.
     for k in 0..npt {
+        let sk = &stplen.col(k)[..3];
+        let bk = &mut betabd.col_mut(k)[..3];
+        let dk = distsq[k];
         for i in 0..3 {
-            let t = stplen[[i, k]] * (1.0 - stplen[[i, k]]) * distsq[k];
-            betabd[[i, k]] = 0.5 * t * t;
+            let t = sk[i] * (1.0 - sk[i]) * dk;
+            bk[i] = 0.5 * t * t;
         }
     }
 
     // PRIMA geometry.f90 L440: predsq = vlag²·(vlag² + alpha·betabd), then NaN → 0 — the quantity
     // (3.11) of the BOBYQA paper. As vlag⁴ + alpha·vlag²·betabd it is vlag²·σ with σ = alpha·β + vlag²
     // the squared Lagrange-update denominator (SIGMA); the step maximizing predsq best conditions
-    // the model.
-    predsq.fill(0.0);
+    // the model. (Full overwrite — no zeroing needed; column-slice access, same op order.)
     for k in 0..npt {
+        let vk = &vlag.col(k)[..3];
+        let bk = &betabd.col(k)[..3];
+        let pk = &mut predsq.col_mut(k)[..3];
         for i in 0..3 {
-            let v = vlag[[i, k]];
+            let v = vk[i];
             let v2 = v * v;
-            predsq[[i, k]] = v2 * (v2 + alpha * betabd[[i, k]]);
-            if predsq[[i, k]].is_nan() {
-                predsq[[i, k]] = 0.0;
+            pk[i] = v2 * (v2 + alpha * bk[i]);
+            if pk[i].is_nan() {
+                pk[i] = 0.0;
             }
         }
     }
@@ -587,7 +633,7 @@ pub(crate) fn geostep(
         // PRIMA geometry.f90 L513–521: s, mask_free, ggfree
         s.fill(0.0);
         // PRIMA: mask_free = (min(xopt - sl, glag) > 0 .or. max(xopt - su, glag) < 0)
-        mask_free.fill(false);
+        // (full overwrite — no per-uphill zeroing needed).
         for i in 0..n {
             mask_free[i] =
                 (xopt[i] - sl[i]).min(glag[i]) > 0.0 || (xopt[i] - su[i]).max(glag[i]) < 0.0;
@@ -610,9 +656,10 @@ pub(crate) fn geostep(
         }
 
         // PRIMA geometry.f90 L529–548: the fix-more loop
+        // XTEMP needs no zeroing: every read of it sits after one of the two unconditional
+        // full writes (inside the loop below, and the post-loop clamp) — a dead store.
         let mut sfixsq = 0.0_f64;
         let mut grdstp = 0.0_f64;
-        xtemp.fill(0.0);
         for _k in 0..n {
             // PRIMA: resis = delbar**2 - sfixsq
             let resis = delbar * delbar - sfixsq;
@@ -629,13 +676,11 @@ pub(crate) fn geostep(
             // mask_fixl = (s >= bigstp .and. xtemp <= sl)
             // mask_fixu = (s >= bigstp .and. xtemp >= su)
             // mask_free = (s >= bigstp .and. .not.(mask_fixl .or. mask_fixu))
-            mask_fixl.fill(false);
-            mask_fixu.fill(false);
+            // (all three masks are fully overwritten below — no per-pass zeroing needed).
             for i in 0..n {
                 mask_fixl[i] = s[i] >= bigstp && xtemp[i] <= sl[i];
                 mask_fixu[i] = s[i] >= bigstp && xtemp[i] >= su[i];
             }
-            new_mask_free.fill(false);
             for i in 0..n {
                 new_mask_free[i] = s[i] >= bigstp && !(mask_fixl[i] || mask_fixu[i]);
             }
@@ -778,7 +823,7 @@ mod tests {
         for st in &corpus {
             let (e, x) = (&st.entry, &st.exit);
             let xpt = e.mat("xpt");
-            let mut ws = GeostepWs::new(xpt.nrows(), xpt.ncols());
+            let mut ws = GeostepWs::new(xpt.nrows(), xpt.ncols()).unwrap();
             let knew = setdrop_tr(
                 e.usize("kopt") - 1,
                 e.i64("ximproved") != 0,
@@ -809,7 +854,7 @@ mod tests {
             let (e, x) = (&st.entry, &st.exit);
             let xpt = e.mat("xpt");
             let mut d = vec![0.0; xpt.nrows()];
-            let mut ws = GeostepWs::new(xpt.nrows(), xpt.ncols());
+            let mut ws = GeostepWs::new(xpt.nrows(), xpt.ncols()).unwrap();
             geostep(
                 e.usize("knew") - 1,
                 e.usize("kopt") - 1,
@@ -870,7 +915,7 @@ mod tests {
         let rho = 0.5;
 
         for kopt in 0..npt {
-            let mut ws = GeostepWs::new(n, npt);
+            let mut ws = GeostepWs::new(n, npt).unwrap();
             let knew = setdrop_tr(
                 kopt, false, &bmat, &d, delta, rho, &xpt, &zmat, &mut ws, None,
             );
@@ -894,7 +939,7 @@ mod tests {
         bmat[[0, 0]] = 3.0;
         let zmat = Mat::zeros(npt, npt - n - 1);
         let xpt = Mat::zeros(n, npt);
-        let mut ws = GeostepWs::new(n, npt);
+        let mut ws = GeostepWs::new(n, npt).unwrap();
         let knew = setdrop_tr(
             kopt,
             false,
@@ -926,7 +971,7 @@ mod tests {
         let n = xpt.nrows();
 
         let mut d = vec![0.0; n];
-        let mut ws = GeostepWs::new(n, xpt.ncols());
+        let mut ws = GeostepWs::new(n, xpt.ncols()).unwrap();
         geostep(
             e.usize("knew") - 1,
             xopt_col,

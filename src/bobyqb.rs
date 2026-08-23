@@ -9,8 +9,8 @@
 //! public `Status` in `lib.rs`.
 
 use crate::consts::{
-    DAMAGING_ROUNDING, INFO_DFT, MAXTR_REACHED, NAN_INF_F, NAN_INF_MODEL, NAN_INF_X, REALMAX,
-    SMALL_TR_RADIUS,
+    DAMAGING_ROUNDING, FTOL_REACHED, INFO_DFT, MAXTR_REACHED, NAN_INF_F, NAN_INF_MODEL, NAN_INF_X,
+    REALMAX, SMALL_TR_RADIUS,
 };
 use crate::geometry::{GeostepWs, geostep, setdrop_tr};
 use crate::initialize::{InitWs, inith, initq, initxf};
@@ -21,7 +21,11 @@ use crate::powalg::{CalWs, calvlag_and_den_into, hess_mul_into, quadinc};
 use crate::rescue::{RescueWs, rescue};
 use crate::trustregion::{TrsboxWs, trrad, trsbox};
 use crate::update::{UpdateWs, tryqalt, updateh, updateq, updatexf};
-use crate::util::{checkexit, evaluate, xinbd_into};
+use crate::util::{checkexit, evaluate, try_capacity, try_vec, xinbd_into};
+use alloc::collections::TryReserveError;
+#[cfg(test)]
+use alloc::vec;
+use alloc::vec::Vec;
 
 /// PRIMA bobyqb.f90 L188: convergence tolerance of the trust-region subproblem solver.
 const TRTOL: f64 = 1.0e-2;
@@ -49,24 +53,24 @@ struct ShiftbaseWs {
 }
 
 impl ShiftbaseWs {
-    fn new(n: usize, npt: usize) -> Self {
-        Self {
-            xopt: vec![0.0; n],
-            xptxav: Mat::zeros(n, npt),
-            sxpt: vec![0.0; npt],
-            ymat: Mat::zeros(n, npt),
-            bmat_npt: Mat::zeros(n, npt),
-            ymat_t: Mat::zeros(npt, n),
-            bymat: Mat::zeros(n, n),
-            yzmat: Mat::zeros(n, npt - n - 1),
-            yzmat_c: Mat::zeros(n, npt - n - 1),
-            yzmat_c_t: Mat::zeros(npt - n - 1, n),
-            zmat_t: Mat::zeros(npt - n - 1, npt),
-            yzyzmat: Mat::zeros(n, n),
-            yz_zt: Mat::zeros(n, npt),
-            v: vec![0.0; n],
-            vxopt: Mat::zeros(n, n),
-        }
+    fn new(n: usize, npt: usize) -> Result<Self, TryReserveError> {
+        Ok(Self {
+            xopt: try_vec(0.0, n)?,
+            xptxav: Mat::try_zeros(n, npt)?,
+            sxpt: try_vec(0.0, npt)?,
+            ymat: Mat::try_zeros(n, npt)?,
+            bmat_npt: Mat::try_zeros(n, npt)?,
+            ymat_t: Mat::try_zeros(npt, n)?,
+            bymat: Mat::try_zeros(n, n)?,
+            yzmat: Mat::try_zeros(n, npt - n - 1)?,
+            yzmat_c: Mat::try_zeros(n, npt - n - 1)?,
+            yzmat_c_t: Mat::try_zeros(npt - n - 1, n)?,
+            zmat_t: Mat::try_zeros(npt - n - 1, npt)?,
+            yzyzmat: Mat::try_zeros(n, n)?,
+            yz_zt: Mat::try_zeros(n, npt)?,
+            v: try_vec(0.0, n)?,
+            vxopt: Mat::try_zeros(n, n)?,
+        })
     }
 }
 
@@ -84,16 +88,16 @@ struct ErrbdWs {
 }
 
 impl ErrbdWs {
-    fn new(n: usize, npt: usize) -> Self {
-        Self {
-            xnew: vec![0.0; n],
-            hm: vec![0.0; n],
-            gnew: vec![0.0; n],
-            bfirst: vec![0.0; n],
-            v: vec![0.0; n],
-            bsecond: vec![0.0; n],
-            dxpt: vec![0.0; npt],
-        }
+    fn new(n: usize, npt: usize) -> Result<Self, TryReserveError> {
+        Ok(Self {
+            xnew: try_vec(0.0, n)?,
+            hm: try_vec(0.0, n)?,
+            gnew: try_vec(0.0, n)?,
+            bfirst: try_vec(0.0, n)?,
+            v: try_vec(0.0, n)?,
+            bsecond: try_vec(0.0, n)?,
+            dxpt: try_vec(0.0, npt)?,
+        })
     }
 }
 
@@ -251,47 +255,47 @@ pub(crate) struct SolverWs {
 
 impl SolverWs {
     /// Allocates every sub-workspace for an `(n, npt)` problem.
-    pub(crate) fn new(n: usize, npt: usize) -> Self {
-        Self {
+    pub(crate) fn new(n: usize, npt: usize) -> Result<Self, TryReserveError> {
+        Ok(Self {
             bobyqb: BobyqbWs {
-                xl: vec![0.0; n],
-                xu: vec![0.0; n],
-                bmat: Mat::zeros(n, npt + n),
-                zmat: Mat::zeros(npt, npt - n - 1),
-                xpt: Mat::zeros(n, npt),
-                hq: Mat::zeros(n, n),
-                fval: vec![0.0; npt],
-                pq: vec![0.0; npt],
-                den: vec![0.0; npt],
-                distsq: vec![0.0; npt],
-                gopt: vec![0.0; n],
-                sl: vec![0.0; n],
-                su: vec![0.0; n],
-                xbase: vec![0.0; n],
-                d: vec![0.0; n],
-                xdrop: vec![0.0; n],
-                xosav: vec![0.0; n],
-                vlag: vec![0.0; npt + n],
-                ij: Vec::with_capacity(npt.saturating_sub(2 * n + 1)),
-                dxpt_q: vec![0.0; npt],
-                pqdxpt: vec![0.0; npt],
-                hqd: vec![0.0; n],
-                xmod: vec![0.0; n],
-                xnew: vec![0.0; n],
-                xnew_clamped: vec![0.0; n],
-                fval_shift: vec![0.0; npt],
-                xopt_copy: vec![0.0; n],
-                best_x: vec![0.0; n],
-                cal: CalWs::new(n, npt),
-                shiftbase: ShiftbaseWs::new(n, npt),
-                errbd: ErrbdWs::new(n, npt),
+                xl: try_vec(0.0, n)?,
+                xu: try_vec(0.0, n)?,
+                bmat: Mat::try_zeros(n, npt + n)?,
+                zmat: Mat::try_zeros(npt, npt - n - 1)?,
+                xpt: Mat::try_zeros(n, npt)?,
+                hq: Mat::try_zeros(n, n)?,
+                fval: try_vec(0.0, npt)?,
+                pq: try_vec(0.0, npt)?,
+                den: try_vec(0.0, npt)?,
+                distsq: try_vec(0.0, npt)?,
+                gopt: try_vec(0.0, n)?,
+                sl: try_vec(0.0, n)?,
+                su: try_vec(0.0, n)?,
+                xbase: try_vec(0.0, n)?,
+                d: try_vec(0.0, n)?,
+                xdrop: try_vec(0.0, n)?,
+                xosav: try_vec(0.0, n)?,
+                vlag: try_vec(0.0, npt + n)?,
+                ij: try_capacity(npt.saturating_sub(2 * n + 1))?,
+                dxpt_q: try_vec(0.0, npt)?,
+                pqdxpt: try_vec(0.0, npt)?,
+                hqd: try_vec(0.0, n)?,
+                xmod: try_vec(0.0, n)?,
+                xnew: try_vec(0.0, n)?,
+                xnew_clamped: try_vec(0.0, n)?,
+                fval_shift: try_vec(0.0, npt)?,
+                xopt_copy: try_vec(0.0, n)?,
+                best_x: try_vec(0.0, n)?,
+                cal: CalWs::new(n, npt)?,
+                shiftbase: ShiftbaseWs::new(n, npt)?,
+                errbd: ErrbdWs::new(n, npt)?,
             },
-            trsbox: TrsboxWs::new(n, npt),
-            geostep: GeostepWs::new(n, npt),
-            rescue: RescueWs::new(n, npt),
-            update: UpdateWs::new(n, npt),
-            init: InitWs::new(n, npt),
-        }
+            trsbox: TrsboxWs::new(n, npt)?,
+            geostep: GeostepWs::new(n, npt)?,
+            rescue: RescueWs::new(n, npt)?,
+            update: UpdateWs::new(n, npt)?,
+            init: InitWs::new(n, npt)?,
+        })
     }
 }
 
@@ -335,7 +339,6 @@ fn redrho(rho_in: f64, rhoend: f64) -> f64 {
 /// (PQ and ZMAT are unchanged). The optional IDZ is absent in BOBYQA (== 1, L87-91).
 /// XOPT is `xpt.col(kopt)`, read inside the body (Fortran L116).
 #[expect(clippy::too_many_arguments)] // out-params mirror the Fortran intent (rust.md §5)
-#[expect(clippy::too_many_lines)] // one Fortran body, transcribed block-for-block
 fn shiftbase(
     kopt: usize,
     xbase: &mut [f64],
@@ -372,8 +375,8 @@ fn shiftbase(
     let xoptsq = inprod(xopt, xopt);
 
     // PRIMA shiftbase.f90 L121: XPTXAV = XPT - HALF * spread(XOPT, dim=2, ncopies=npt),
-    // i.e., XPT - XAV where XAV = (XBASE + XOPT)/2 relative to XBASE.
-    xptxav.fill(0.0);
+    // i.e., XPT - XAV where XAV = (XBASE + XOPT)/2 relative to XBASE (full overwrite — no
+    // zeroing needed).
     for k in 0..npt {
         for i in 0..n {
             xptxav[[i, k]] = xpt[[i, k]] - 0.5 * xopt[i];
@@ -388,8 +391,8 @@ fn shiftbase(
     }
 
     // PRIMA shiftbase.f90 L127-130: YMAT(:,k) = SXPT(k)*XPTXAV(:,k) + QXOPTQ*XOPT.
+    // YMAT is fully overwritten below — no zeroing needed.
     let qxoptq = 0.25 * xoptsq;
-    ymat.fill(0.0);
     for k in 0..npt {
         for i in 0..n {
             ymat[[i, k]] = sxpt[k] * xptxav[[i, k]] + qxoptq * xopt[i];
@@ -398,13 +401,12 @@ fn shiftbase(
 
     // PRIMA shiftbase.f90 L133: BYMAT = MATPROD(BMAT(:, 1:NPT), TRANSPOSE(YMAT)).
     // BMAT(:, 1:NPT) is n x npt; YMAT is n x npt so TRANSPOSE(YMAT) is npt x n.
-    bmat_npt.fill(0.0);
+    // BMAT_NPT/YMAT_T are fully overwritten below — no zeroing needed.
     for k in 0..npt {
         for i in 0..n {
             bmat_npt[[i, k]] = bmat[[i, k]];
         }
     }
-    ymat_t.fill(0.0);
     for k in 0..npt {
         for i in 0..n {
             ymat_t[[k, i]] = ymat[[i, k]];
@@ -429,7 +431,7 @@ fn shiftbase(
     yzmat_c.copy_from(yzmat); // L138 negation slice (1:idz-1) is empty for BOBYQA (IDZ==1)
 
     // L139: BMAT(:, NPT+1:NPT+N) += MATPROD(YZMAT, TRANSPOSE(YZMAT_C)).
-    yzmat_c_t.fill(0.0);
+    // YZMAT_C_T is fully overwritten below — no zeroing needed.
     for j in 0..yzmat_c.ncols() {
         for i in 0..n {
             yzmat_c_t[[j, i]] = yzmat_c[[i, j]];
@@ -443,7 +445,7 @@ fn shiftbase(
     }
 
     // L140: BMAT(:, 1:NPT) += MATPROD(YZMAT_C, TRANSPOSE(ZMAT)).
-    zmat_t.fill(0.0);
+    // ZMAT_T is fully overwritten below — no zeroing needed.
     for j in 0..zmat.ncols() {
         for k in 0..npt {
             zmat_t[[j, k]] = zmat[[k, j]];
@@ -490,6 +492,7 @@ fn shiftbase(
 /// (BOBYQA paper, around (6.8)-(6.11)). Called only on SHORTD/TRFAIL iterations (L352).
 #[expect(clippy::too_many_arguments)] // the argument list mirrors the Fortran signature (rust.md §5)
 #[expect(clippy::similar_names)] // PRIMA identifiers xpt/xopt are load-bearing (rust.md §5)
+#[expect(clippy::needless_range_loop)] // explicit indexed loops mirror PRIMA (rust.md §5)
 fn errbd(
     crvmin: f64,
     d: &[f64],
@@ -517,15 +520,14 @@ fn errbd(
         dxpt,
     } = ws;
 
-    // PRIMA bobyqb.f90 L766: XNEW = XOPT + D.
-    xnew.fill(0.0);
+    // PRIMA bobyqb.f90 L766: XNEW = XOPT + D (full overwrite — no zeroing needed).
     for i in 0..n {
         xnew[i] = xopt[i] + d[i];
     }
 
-    // PRIMA bobyqb.f90 L767: GNEW = GOPT + HESS_MUL(D, XPT, PQ, HQ).
+    // PRIMA bobyqb.f90 L767: GNEW = GOPT + HESS_MUL(D, XPT, PQ, HQ) (full overwrite — no
+    // zeroing needed).
     hess_mul_into(d, xpt, pq, Some(hq), dxpt, hm);
-    gnew.fill(0.0);
     for i in 0..n {
         gnew[i] = gopt[i] + hm[i];
     }
@@ -551,12 +553,18 @@ fn errbd(
     // V[i] = sum_{k} xpt[[i,k]]^2 * pq[k].
     let rhosq = rho * rho;
     v.fill(0.0);
-    for k in 0..npt {
-        for i in 0..n {
-            v[i] += (xpt[[i, k]] * xpt[[i, k]]) * pq[k];
+    {
+        // Column-slice access: same k-outer/i-ascending accumulation, bounds-check-free.
+        let v = &mut v[..n];
+        for k in 0..npt {
+            let xk = &xpt.col(k)[..n];
+            let pqk = pq[k];
+            for i in 0..n {
+                v[i] += (xk[i] * xk[i]) * pqk;
+            }
         }
     }
-    bsecond.fill(0.0);
+    // BSECOND is fully overwritten below — no zeroing needed.
     for i in 0..n {
         bsecond[i] = 0.5 * (hq[[i, i]] + v[i]) * rhosq;
     }
@@ -719,6 +727,10 @@ pub(crate) fn bobyqb<F: FnMut(&[f64]) -> f64>(
     eta1: f64,
     eta2: f64,
     ftarget: f64,
+    // ftol spec §2: `Some((rel, abs))` enables the stage-granularity f-tolerance stop at
+    // the rho-reduction site; `None` (the only value `Config` with both fields unset can
+    // produce) never reaches the check, keeping the default path literally unchanged.
+    ftol: Option<(f64, f64)>,
     gamma1: f64,
     gamma2: f64,
     rhobeg: f64,
@@ -883,6 +895,12 @@ pub(crate) fn bobyqb<F: FnMut(&[f64]) -> f64>(
     let mut best_f = REALMAX;
     let mut fire_restart = false;
 
+    // ftol stage tracker (ftol spec §2): best f at the moment the current rho stage began.
+    // `None` before the first completed stage — the guard against triggering on stage one —
+    // and reset to `None` at every restart rebuild (a new cycle's first stage is a first
+    // stage). Only ever read/written when `ftol.is_some()`, so the default path is inert.
+    let mut ftol_stage_f: Option<f64> = None;
+
     // PRIMA bobyqb.f90 L324: begin the iterative procedure.
     for _tr in 1..=maxtr {
         // The restart body, entered by any trigger (hard-restart spec §4: a schedule is a set
@@ -948,6 +966,9 @@ pub(crate) fn bobyqb<F: FnMut(&[f64]) -> f64>(
                 ratio = -1.0;
                 knew_tr = None;
                 itest = 0;
+                // ftol spec §2: the rebuilt cycle's first stage is a first stage — no
+                // baseline carries across a restart.
+                ftol_stage_f = None;
                 if subinfo != INFO_DFT {
                     info = subinfo;
                     break;
@@ -1167,13 +1188,18 @@ pub(crate) fn bobyqb<F: FnMut(&[f64]) -> f64>(
         let accurate_mod = moderr_rec.iter().all(|v| math::abs(*v) <= ebound)
             && dnorm_rec.iter().all(|&v| v <= rho);
         // PRIMA bobyqb.f90 L465-467: CLOSE_ITPSET — are the interpolation points close to XOPT?
-        for k in 0..npt {
-            let mut sq = 0.0;
-            for i in 0..n {
-                let diff = xpt[[i, k]] - xpt[[i, kopt]];
-                sq += diff * diff;
+        // Column-slice access: same per-element ops in the same order, bounds-check-free.
+        {
+            let xko = &xpt.col(kopt)[..n];
+            for k in 0..npt {
+                let xk = &xpt.col(k)[..n];
+                let mut sq = 0.0;
+                for i in 0..n {
+                    let diff = xk[i] - xko[i];
+                    sq += diff * diff;
+                }
+                distsq[k] = sq;
             }
-            distsq[k] = sq;
         }
         let close_itpset = distsq
             .iter()
@@ -1310,6 +1336,26 @@ pub(crate) fn bobyqb<F: FnMut(&[f64]) -> f64>(
 
         // PRIMA bobyqb.f90 L612-625: reduce RHO; update DELTA at the same time.
         if reduce_rho {
+            // The ftol stage check (ftol spec §2), the feature's single code site. Placement
+            // is spec-pinned: BEFORE the restart hook (ftol wins when both would fire at the
+            // same reduction — FtolReached is converged-class and must not spend a restart),
+            // and skipped at `rho <= rhoend` (the ladder finishing exits Converged below, as
+            // today; FtolReached only fires where it actually saves evaluations). `df >= 0`
+            // by monotonicity of best-f within a cycle. No Newton-Raphson tail eval on this
+            // exit — the post-loop tail stays gated on SMALL_TR_RADIUS.
+            if let Some((ftol_rel, ftol_abs)) = ftol {
+                if rho > rhoend {
+                    let fopt = fval[kopt];
+                    if let Some(stage_start) = ftol_stage_f {
+                        let df = stage_start - fopt;
+                        if df <= ftol_rel * fopt.abs().max(1.0) + ftol_abs {
+                            info = FTOL_REACHED;
+                            break;
+                        }
+                    }
+                    ftol_stage_f = Some(fopt);
+                }
+            }
             // The restart hook (hard-restart spec §4, stall-restart spec §4).
             // `Bobyqa` with `restart: None` → inert, and the block reduces RHO exactly as
             // PRIMA does. Two triggers share this one restart body: at `rho <= rhoend` the
@@ -1447,7 +1493,7 @@ mod tests {
     fn bobyqb_converges_on_the_sphere_to_small_tr_radius() {
         let mut sphere = |x: &[f64]| x.iter().map(|v| v * v).sum::<f64>();
         let mut x = vec![1.0, 2.0];
-        let mut ws = SolverWs::new(2, 5);
+        let mut ws = SolverWs::new(2, 5).unwrap();
         ws.bobyqb.xl.copy_from_slice(&[-5.0, -5.0]);
         ws.bobyqb.xu.copy_from_slice(&[5.0, 5.0]);
         let (f, nf, info) = bobyqb(
@@ -1457,6 +1503,7 @@ mod tests {
             0.1,
             0.7,
             f64::NEG_INFINITY,
+            None,
             0.5,
             2.0,
             0.5,
@@ -1484,7 +1531,7 @@ mod tests {
         let d = vec![0.1, 0.1];
         let moderr_rec = [0.25, -0.5];
         let (sl, su) = (vec![-1.0; n], vec![1.0; n]);
-        let mut ws = ErrbdWs::new(n, npt);
+        let mut ws = ErrbdWs::new(n, npt).unwrap();
         // Interior xnew, crvmin = 0: bfirst = maxval|moderr_rec| = 0.5 everywhere, bsecond = 0.
         let e = errbd(
             0.0,
@@ -1546,7 +1593,7 @@ mod tests {
         let xpt1 = Mat::from_col_major(1, 1, vec![3.0]);
         let mut hq1 = Mat::zeros(1, 1);
         hq1[[0, 0]] = 1.0;
-        let mut ws1 = ErrbdWs::new(1, 1);
+        let mut ws1 = ErrbdWs::new(1, 1).unwrap();
         let e = errbd(
             0.0,
             &[0.0],
@@ -1568,7 +1615,7 @@ mod tests {
         let mut hq2 = Mat::zeros(1, 1);
         hq2[[0, 0]] = 2.0;
         let xpt2 = Mat::zeros(1, 1);
-        let mut ws2 = ErrbdWs::new(1, 1);
+        let mut ws2 = ErrbdWs::new(1, 1).unwrap();
         let e = errbd(
             0.0,
             &[0.5],
@@ -1589,7 +1636,7 @@ mod tests {
         let mut hq3 = Mat::zeros(1, 1);
         hq3[[0, 0]] = 2.0;
         let xpt3 = Mat::zeros(1, 1);
-        let mut ws3 = ErrbdWs::new(1, 1);
+        let mut ws3 = ErrbdWs::new(1, 1).unwrap();
         let e = errbd(
             0.0,
             &[-0.5],
@@ -1685,7 +1732,7 @@ mod tests {
         let h_before = full_hessian(&hq, &pq, &xpt);
 
         let mut xpt2 = xpt.clone();
-        let mut ws = ShiftbaseWs::new(n, npt);
+        let mut ws = ShiftbaseWs::new(n, npt).unwrap();
         shiftbase(
             kopt, &mut xbase, &mut xpt2, &zmat, &mut bmat, &pq, &mut hq, &mut ws,
         );

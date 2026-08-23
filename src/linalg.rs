@@ -9,6 +9,8 @@
 use crate::consts::{REALMAX, SYMTOL};
 use crate::mat::Mat;
 use crate::math;
+use alloc::vec;
+use alloc::vec::Vec;
 
 /// PRIMA linalg.f90 L465 `inprod`: z = x^T y, accumulated in element order.
 pub(crate) fn inprod(x: &[f64], y: &[f64]) -> f64 {
@@ -22,12 +24,19 @@ pub(crate) fn inprod(x: &[f64], y: &[f64]) -> f64 {
 
 /// PRIMA linalg.f90 L332 `matprod12`: row-vector x times matrix y; z(j) = inprod(x, y(:, j)).
 /// Writes the full result into `z` (length `y.ncols()`).
-#[expect(clippy::needless_range_loop)] // explicit indexed loops mirror PRIMA (rust.md §5)
 pub(crate) fn matprod12_into(x: &[f64], y: &Mat, z: &mut [f64]) {
     debug_assert_eq!(x.len(), y.nrows());
     debug_assert_eq!(z.len(), y.ncols());
-    for j in 0..y.ncols() {
-        z[j] = inprod(x, y.col(j));
+    if y.nrows() == 0 {
+        // Degenerate shape: every inprod over an empty column is 0.0 (chunks_exact(0) would panic).
+        z.fill(0.0);
+        return;
+    }
+    // Length-equalized reslice + chunks_exact columns: bounds-check-free inprods; each z[j] is
+    // still the same in-order dot product of x with column j.
+    let x = &x[..y.nrows()];
+    for (zj, yj) in z.iter_mut().zip(y.data().chunks_exact(y.nrows())) {
+        *zj = inprod(x, yj);
     }
 }
 
@@ -46,8 +55,21 @@ pub(crate) fn matprod12(x: &[f64], y: &Mat) -> Vec<f64> {
 pub(crate) fn matprod21_into(x: &Mat, y: &[f64], z: &mut [f64]) {
     debug_assert_eq!(x.ncols(), y.len());
     debug_assert_eq!(z.len(), x.nrows());
-    z.fill(0.0);
-    for j in 0..x.ncols() {
+    if x.ncols() == 0 {
+        z.fill(0.0);
+        return;
+    }
+    // The j = 0 pass fuses the zeroing into the first accumulation: `0.0 + x0[i]*y0` is the
+    // exact operation the fill-then-`+=` pair performed (NOT folded to a bare product — that
+    // would flip -0.0 results), so the separate memset over z is elided bit-identically.
+    {
+        let x0 = &x.col(0)[..z.len()];
+        let y0 = y[0];
+        for i in 0..z.len() {
+            z[i] = 0.0 + x0[i] * y0;
+        }
+    }
+    for j in 1..x.ncols() {
         // Length-equalized reslice: bounds-check-free inner loop; the lanes are
         // independent accumulators, so vectorization cannot reorder any z[i]'s sum.
         let xj = &x.col(j)[..z.len()];
@@ -115,6 +137,12 @@ pub(crate) fn outprod(x: &[f64], y: &[f64]) -> Mat {
     z
 }
 
+/// `radix^((MIN_EXP - 1).max(1 - MAX_EXP))` = `2^-1022`, exactly `f64::MIN_POSITIVE` — the
+/// `norm` rescue's `scalmin`, as a const so no math backend needs a `powi` (`no_std` spec §6).
+const SCALMIN: f64 = f64::MIN_POSITIVE;
+/// `radix^((MAX_EXP - 1).min(1 - MIN_EXP))` = `2^1022` — the `norm` rescue's `scalmax`.
+const SCALMAX: f64 = f64::from_bits(0x7FD0_0000_0000_0000);
+
 /// PRIMA linalg.f90 L1862 `p_norm`, p = 2 branch only (BOBYQA only calls `norm(x)`): the
 /// empty/non-finite/zero guards + naive sqrt(sum(x**2)) + the radix-scaling overflow rescue.
 pub(crate) fn norm(x: &[f64]) -> f64 {
@@ -143,13 +171,13 @@ pub(crate) fn norm(x: &[f64]) -> f64 {
         let mut y = math::sqrt(sumsq);
         if (y.is_infinite() && y.is_sign_positive()) || y <= 0.0 {
             // PRIMA p_norm overflow/underflow rescue. Fortran's minexponent/maxexponent equal
-            // Rust's MIN_EXP/MAX_EXP. The min/max mirror the Fortran formula (no-ops for f64,
-            // meaningful for other precisions PRIMA supports).
-            #[expect(clippy::unnecessary_min_or_max)]
-            let scalmin = f64::from(f64::RADIX).powi((f64::MIN_EXP - 1).max(1 - f64::MAX_EXP));
-            #[expect(clippy::unnecessary_min_or_max)]
-            let scalmax = f64::from(f64::RADIX).powi((f64::MAX_EXP - 1).min(1 - f64::MIN_EXP));
-            let scaling = scalmax.min(scalmin.max(maxabs));
+            // Rust's MIN_EXP/MAX_EXP; PRIMA's radix**(minexponent-1)/radix**(maxexponent-1)
+            // formulas (with their no-op-for-f64 min/max guards) resolve to the compile-time
+            // constants 2^-1022 and 2^1022 — both exact powers of two, written as consts so no
+            // math backend needs a `powi` (no_std spec §5 task 1; the unit test
+            // `scal_consts_match_the_original_powi_expressions` pins them to the original powi
+            // expressions).
+            let scaling = SCALMAX.min(SCALMIN.max(maxabs));
             let mut scaled_sumsq = 0.0;
             for &v in x {
                 let s = v / scaling;
@@ -289,9 +317,14 @@ pub(crate) fn r1update(a: &mut Mat, alpha: f64, x: &[f64]) {
     let n = x.len();
     debug_assert_eq!((a.nrows(), a.ncols()), (n, n));
     // PRIMA: do j = 1, n: A(j:n, j) = A(j:n, j) + alpha * x(j:n) * x(j).
+    // Column-slice reslice: bounds-check-free inner loop over the j:n tail; each cell still
+    // computes (alpha * x[i]) * x[j] exactly as the indexed form did (i = j + t).
     for j in 0..n {
-        for i in j..n {
-            a[[i, j]] += alpha * x[i] * x[j];
+        let xj = x[j];
+        let aj = &mut a.col_mut(j)[j..n];
+        let xt = &x[j..n];
+        for t in 0..aj.len() {
+            aj[t] += alpha * xt[t] * xj;
         }
     }
     symmetrize(a);
@@ -305,9 +338,14 @@ pub(crate) fn r2update(a: &mut Mat, alpha: f64, x: &[f64], y: &[f64]) {
     // PRIMA linalg.f90 L269: A(j:n, j) = A(j:n, j) + alpha * x(j:n) * y(j) + alpha * y(j:n) * x(j),
     // evaluated LEFT-ASSOCIATIVELY: (A + t1) + t2, never A + (t1 + t2). The grouping is a 1-ulp
     // parity matter — `+=` would sum the cross-terms first.
+    // Column-slice reslice: see r1update — same left-associative grouping per cell (i = j + t).
     for j in 0..n {
-        for i in j..n {
-            a[[i, j]] = (a[[i, j]] + alpha * x[i] * y[j]) + alpha * y[i] * x[j];
+        let (xj, yj) = (x[j], y[j]);
+        let aj = &mut a.col_mut(j)[j..n];
+        let xt = &x[j..n];
+        let yt = &y[j..n];
+        for t in 0..aj.len() {
+            aj[t] = (aj[t] + alpha * xt[t] * yj) + alpha * yt[t] * xj;
         }
     }
     symmetrize(a);
@@ -438,6 +476,18 @@ mod tests {
                 "G not orthogonal for {x:?}"
             );
         }
+    }
+
+    #[test]
+    fn scal_consts_match_the_original_powi_expressions() {
+        // no_std spec §6: the consts replace std-only `powi` calls; pin them bit-for-bit to the
+        // original PRIMA-transcribed expressions (tests always build with std).
+        #[expect(clippy::unnecessary_min_or_max)]
+        let scalmin = f64::from(f64::RADIX).powi((f64::MIN_EXP - 1).max(1 - f64::MAX_EXP));
+        #[expect(clippy::unnecessary_min_or_max)]
+        let scalmax = f64::from(f64::RADIX).powi((f64::MAX_EXP - 1).min(1 - f64::MIN_EXP));
+        assert_eq!(SCALMIN.to_bits(), scalmin.to_bits());
+        assert_eq!(SCALMAX.to_bits(), scalmax.to_bits());
     }
 
     #[test]

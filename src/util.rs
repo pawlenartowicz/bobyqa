@@ -6,6 +6,33 @@ use crate::consts::{
     FTARGET_ACHIEVED, FUNCMAX, INFO_DFT, MAXFUN_REACHED, NAN_INF_F, NAN_INF_X, REALMAX,
 };
 use crate::math;
+#[cfg(test)]
+use alloc::vec;
+#[cfg(test)]
+use alloc::vec::Vec;
+
+/// Fallible `vec![value; len]`: reserves via `try_reserve_exact` so an out-of-memory
+/// (or byte-capacity-overflow) request surfaces as an `Err` instead of aborting the
+/// process (safe-checks spec S2). Construction-time only — the warm path never allocates.
+pub(crate) fn try_vec<T: Clone>(
+    value: T,
+    len: usize,
+) -> Result<alloc::vec::Vec<T>, alloc::collections::TryReserveError> {
+    let mut v = alloc::vec::Vec::new();
+    v.try_reserve_exact(len)?;
+    v.resize(len, value);
+    Ok(v)
+}
+
+/// Fallible `Vec::with_capacity(cap)` — same S2 contract as [`try_vec`], for the
+/// capacity-only stores that are filled later (`ij`, the restart boundary store).
+pub(crate) fn try_capacity<T>(
+    cap: usize,
+) -> Result<alloc::vec::Vec<T>, alloc::collections::TryReserveError> {
+    let mut v = alloc::vec::Vec::new();
+    v.try_reserve_exact(cap)?;
+    Ok(v)
+}
 
 /// PRIMA evaluate.f90 L27 `moderatex`, one element: NaN -> 0, then clamp to
 /// [-REALMAX, REALMAX]. `moderatex` is elementwise, so the scalar form composes exactly.

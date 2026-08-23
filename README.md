@@ -6,9 +6,13 @@
 [![license: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
 **Minimize a function from values alone — no derivatives — subject to box bounds.** A pure-Rust,
-dependency-free port of M. J. D. Powell's **BOBYQA** (Bound Optimization BY Quadratic
+dependency-free-by-default, `no_std`-compatible port of M. J. D. Powell's **BOBYQA** (Bound Optimization BY Quadratic
 Approximation), transcribed from [PRIMA](https://github.com/libprima/prima)  — see [Design](#design).
 As of 2026-06 there is no other pure-Rust BOBYQA on crates.io; the alternatives are all C-library bindings.
+
+The solver itself is a faithful port. On top of it sits one optional, off-by-default layer —
+[restarts](#restarts) — which is not part of BOBYQA as Powell published it; see
+[Credits](#credits) for what came from where.
 
 ## When to use it
 
@@ -112,6 +116,12 @@ the cap off, `rho_end` restarts on the settle test as before.
 **`Config::max_fun` is the TOTAL evaluation budget across all restarts**, not a
 per-cycle allowance — size it accordingly when enabling restarts.
 
+The idea of restarting a converged model-based solve this way is Cartis, Roberts and
+co-authors', from the Py-BOBYQA papers ([TOMS 2019](https://doi.org/10.1145/3338517),
+[Optimization 2022](https://doi.org/10.1080/02331934.2021.1883015)). What triggers a
+restart here, and the guarantees around it, are this crate's own — see
+[Credits](#credits).
+
 `Config` and `RestartConfig` are `#[non_exhaustive]`: build them with `Config::new(n)` /
 `RestartConfig::new()` and assign fields, as above — struct literals and
 `..Config::new(n)` update syntax won't compile downstream.
@@ -120,15 +130,33 @@ per-cycle allowance — size it accordingly when enabling restarts.
 
 | Design | Detail |
 |---|---|
-| Faithful port | behaviour-for-behaviour port of PRIMA's modern-Fortran BOBYQA — the same trust-region method, Lagrange-model maintenance, geometry-restoring rescue, and box handling that earn BOBYQA its robustness |
+| Faithful port | behaviour-for-behaviour port of PRIMA's modern-Fortran BOBYQA — the same trust-region method, Lagrange-model maintenance, geometry-restoring rescue, and box handling that earn BOBYQA its robustness. [Restarts](#restarts) are the one addition, off by default, and leave the port untouched when unused |
 | Bit-exact parity | reproduces PRIMA bit-for-bit across the golden `(x, f)` trajectory battery — every evaluation in order, the rescue path included — natively and on `wasm32-wasip1` |
 | Pure Rust | no C, Fortran, or system libraries; builds anywhere `cargo` does, including `wasm32-unknown-unknown` |
-| Zero dependencies | std/core/alloc only (dev-dependencies for tests only) |
+| Zero dependencies | zero by default; the optional `libm` feature (the `no_std` math backend) is the only dependency, and only when you ask for it |
+| `no_std` + `alloc` | `default-features = false, features = ["libm"]` builds without `std` — see [`no_std` usage](#no_std-usage) |
 | No `unsafe` | `#![forbid(unsafe_code)]` at the crate root |
 | Deterministic | no RNG, no global state, no threads, no I/O — same inputs → same outputs on a given target |
 | Zero-alloc warm path | construct `Bobyqa` once; `minimize` performs no heap allocation |
 | Errors, not panics | invalid arguments return a `Status`; the solver does not panic |
 | Bounds honoured | every objective evaluation lies within `[lower, upper]` |
+
+## `no_std` usage
+
+The crate is `#![no_std]` + `alloc`: it needs an allocator (`Bobyqa::new` allocates once per
+problem size; `minimize` allocates nothing) but not an operating system. Turn off the default
+`std` feature and enable `libm`, which supplies the float math `core` lacks:
+
+```toml
+[dependencies]
+bobyqa = { version = "0.3", default-features = false, features = ["libm"] }
+```
+
+Two things change without `std`: the `std::error::Error` impl on `Status` is absent (`Status`
+keeps `Display`), and math routes through [`libm`](https://crates.io/crates/libm) — the crate's
+only (optional) dependency. CI proves the libm backend bit-exact by running the entire PRIMA
+golden-trajectory battery against it, and proves the `no_std` claim by building for the
+bare-metal `thumbv7em-none-eabihf` target.
 
 ## Citing
 
@@ -140,11 +168,48 @@ If this crate contributes to published research, please cite Powell's algorithm 
 > Z. Zhang, *PRIMA: Reference Implementation for Powell's methods with Modernization and
 > Amelioration*, https://www.libprima.net.
 
+If you use [restarts](#restarts), please also cite the work the mechanism comes from:
+
+> C. Cartis, J. Fiala, B. Marteau and L. Roberts, *Improving the Flexibility and Robustness
+> of Model-Based Derivative-Free Optimization Solvers*, ACM Transactions on Mathematical
+> Software 45(3), 32:1–32:41, 2019. <https://doi.org/10.1145/3338517>
+
+> C. Cartis, L. Roberts and O. Sheridan-Methven, *Escaping local minima with derivative-free
+> methods: a numerical investigation*, Optimization 71(8), 2343–2373, 2022.
+> <https://doi.org/10.1080/02331934.2021.1883015>
+
 ## Credits
 
-Ported from **PRIMA** (libprima, BSD-3-Clause) by Zaikun Zhang et al. — `v0.7.2+`, commit
+This crate is three things, and it is worth being clear about which is which.
+
+**The solver is a port.** Everything that does the optimising — the trust-region method, the
+`BMAT`/`ZMAT` Lagrange-model maintenance, the geometry-restoring rescue, the box handling —
+is transcribed behaviour-for-behaviour from **PRIMA** (libprima, BSD-3-Clause) by Zaikun
+Zhang et al. — `v0.7.2+`, commit
 [`1d76fb88`](https://github.com/libprima/prima/commit/1d76fb88aeffb427cd17ed1e9d0d3b34f414913f),
-2026-05-27.
+2026-05-27 — which in turn implements Powell's BOBYQA. None of it is original here, and that
+is the point: faithfulness is what earns BOBYQA its robustness, and the bit-exact parity
+battery exists to prove none was lost in translation.
+
+**The restart idea is Cartis, Fiala, Marteau, Roberts and Sheridan-Methven's**, from the
+Py-BOBYQA papers cited under [Citing](#citing): that a converged model-based solve can be
+usefully restarted by resetting the trust-region radius and rebuilding the interpolation set
+around the best point found, and that doing so is how a local solver escapes a local minimum.
+It is implemented here from the algorithmic description in those papers, on top of the
+crate's own PRIMA-derived geometry routines.
+
+**The restart policy is mine.** What decides *when* a restart happens, and what is guaranteed
+around it, was designed and measured here: the `cycle_budget_frac` eval cap as the primary trigger
+(consulted every trust-region iteration, so it fires on a cycle that is crawling without
+reducing `rho` — where a reduction-sited trigger has no site to fire from); the coupling that
+makes the cap suppress the `rho_end` trigger, so an ordinary solve that finishes inside its
+cap is left bit-for-bit alone; the `stall_reductions` stalled-tail trigger; the monotone
+best-point record that makes a restart unable to return a worse answer than stopping; and the
+zero-alloc integration, in which a rebuild reuses buffers `Bobyqa::new` had already sized.
+Three things from the papers were considered and deliberately left out: the noise-aware
+auto-detection trigger (this crate is scoped to smooth deterministic objectives), the adaptive
+`rho` reset scaling, and randomised interpolation-point replacement — which determinism, a
+hard invariant here, rules out outright.
 
 ## License
 

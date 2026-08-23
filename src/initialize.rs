@@ -11,7 +11,11 @@ use crate::consts::{INFO_DFT, REALMAX};
 use crate::linalg::matprod21_into;
 use crate::mat::Mat;
 use crate::powalg::setij_into;
-use crate::util::{checkexit, evaluate, xinbd_into};
+use crate::util::{checkexit, evaluate, try_vec, xinbd_into};
+use alloc::collections::TryReserveError;
+#[cfg(test)]
+use alloc::vec;
+use alloc::vec::Vec;
 
 /// Reused scratch for the initialize.f90 routines — PRIMA's per-call locals, hoisted to the
 /// solver workspace. Lifetime and contents per call are identical to the Fortran
@@ -30,16 +34,16 @@ pub(crate) struct InitWs {
 }
 
 impl InitWs {
-    pub(crate) fn new(n: usize, npt: usize) -> Self {
+    pub(crate) fn new(n: usize, npt: usize) -> Result<Self, TryReserveError> {
         let ndiag = n.min(npt - n - 1);
-        Self {
-            evaluated: vec![false; npt],
-            x: vec![0.0; n],
-            xmod: vec![0.0; n],
-            xa: vec![0.0; ndiag],
-            xb: vec![0.0; ndiag],
-            shift: vec![0.0; n],
-        }
+        Ok(Self {
+            evaluated: try_vec(false, npt)?,
+            x: try_vec(0.0, n)?,
+            xmod: try_vec(0.0, n)?,
+            xa: try_vec(0.0, ndiag)?,
+            xb: try_vec(0.0, ndiag)?,
+            shift: try_vec(0.0, n)?,
+        })
     }
 }
 
@@ -389,7 +393,7 @@ mod tests {
             let mut fval = vec![0.0; npt];
             let (mut sl, mut su, mut xbase) = (vec![0.0; n], vec![0.0; n], vec![0.0; n]);
             let mut xpt = Mat::zeros(n, npt);
-            let mut ws = InitWs::new(n, npt);
+            let mut ws = InitWs::new(n, npt).unwrap();
             let (kopt, nf, info) = initxf(
                 &mut |p: &[f64]| f(p),
                 e.usize("maxfun"),
@@ -436,7 +440,7 @@ mod tests {
             let mut gopt = vec![0.0; n];
             let mut hq = Mat::zeros(n, n);
             let mut pq = vec![0.0; fval.len()];
-            let mut ws = InitWs::new(xpt.nrows(), xpt.ncols());
+            let mut ws = InitWs::new(xpt.nrows(), xpt.ncols()).unwrap();
             // No `info` diff: the bobyqb.f90 call site on this pin omits the optional INFO, so
             // the guarded dump emits nothing (oracle/README.md, Instrumentation).
             let _info = initq(&ij, &fval, &xpt, &mut gopt, &mut hq, &mut pq, &mut ws);
@@ -459,7 +463,7 @@ mod tests {
             let (n, npt) = (xpt.nrows(), xpt.ncols());
             let mut bmat = Mat::zeros(n, npt + n);
             let mut zmat = Mat::zeros(npt, npt - n - 1);
-            let mut ws = InitWs::new(n, npt);
+            let mut ws = InitWs::new(n, npt).unwrap();
             // No `info` diff: the bobyqb.f90 call site on this pin omits the optional INFO
             // (oracle/README.md, Instrumentation).
             let _info = inith(&ij, &xpt, &mut bmat, &mut zmat, &mut ws);

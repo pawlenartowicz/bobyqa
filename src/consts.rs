@@ -40,6 +40,9 @@ pub(crate) const NAN_INF_MODEL: i32 = -3;
 #[allow(dead_code)] // validation rejects this before the loop; constant kept for PRIMA infos.f90 parity
 pub(crate) const NO_SPACE_BETWEEN_BOUNDS: i32 = 6;
 pub(crate) const DAMAGING_ROUNDING: i32 = 7;
+/// Crate extension, no PRIMA counterpart (ftol spec): the best f improved by less than the
+/// configured `ftol` over one full rho stage. Value chosen clear of infos.f90's range.
+pub(crate) const FTOL_REACHED: i32 = 30;
 
 #[cfg(test)]
 mod tests {

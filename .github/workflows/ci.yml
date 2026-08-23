@@ -1,4 +1,4 @@
-# CI — the rust.md §13 checklist minus the v0.1.1+ no_std line, on stable.
+# CI — the rust.md §13 checklist, on stable (no_std gates included since 0.3.0).
 #
 # The test step IS the parity and allocation gate: the goldens live in-repo
 # (tests/goldens/), so PRIMA never builds here ("freeze then forget", roadmap).
@@ -21,7 +21,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-          targets: wasm32-unknown-unknown, wasm32-wasip1
+          targets: wasm32-unknown-unknown, wasm32-wasip1, thumbv7em-none-eabihf
       - uses: bytecodealliance/actions/wasmtime/setup@v1
 
       # 1. Formatting.
@@ -38,6 +38,12 @@ jobs:
       - run: cargo test --features count-kernels --test kernel_counts --locked
       - run: cargo test --doc --locked
 
+      # 3b. The libm parity gate (no_std spec §6): std + libm gives libm math under a std test
+      #     harness, so the FULL battery — every bit-exact golden — runs against the libm
+      #     backend. If any golden moves by one bit, the no_std story stops here.
+      - run: cargo clippy --all-targets --features libm --locked -- -D warnings
+      - run: cargo test --all-targets --features libm --locked
+
       # 4. wasm build gate (SPEC §1.2 firm target; no JS glue — rust.md §9).
       - run: cargo build --target wasm32-unknown-unknown --locked
 
@@ -48,6 +54,11 @@ jobs:
       - run: cargo test --target wasm32-wasip1 --test parity_prima --locked
         env:
           CARGO_TARGET_WASM32_WASIP1_RUNNER: wasmtime run --dir ${{ github.workspace }}::${{ github.workspace }}
+
+      # 5b. no_std build gate (no_std spec §7.5): a bare-metal target has no std to fall back
+      #     on, so this is the proof that the crate is genuinely no_std + alloc. Compile-only;
+      #     a bare target cannot run the harness (the libm parity gate above covers behaviour).
+      - run: cargo build --no-default-features --features libm --target thumbv7em-none-eabihf --locked
 
       # 6. Bench compile check (rust.md §13) — vacuously green until benches exist.
       - run: cargo bench --no-run --locked

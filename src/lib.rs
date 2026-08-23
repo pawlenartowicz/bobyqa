@@ -22,8 +22,28 @@
 //!   ([`Bobyqa::new`] is the sole allocation site, sized once for the problem's
 //!   `(n, npt)` and restart schedule); a built solver then runs
 //!   [`Bobyqa::minimize`] with no further allocation.
+//!
+//! # Cargo features and `no_std`
+//!
+//! The crate is `#![no_std]` + `alloc`. Two orthogonal features (both hold the bit-exact
+//! parity guarantee):
+//! - **`std`** (default) — gates the `std::error::Error` impl on [`Status`]; without it
+//!   `Status` keeps `Display` only. Nothing else.
+//! - **`libm`** — backs the float math with the [`libm`](https://crates.io/crates/libm)
+//!   crate instead of std intrinsics; the only dependency, pulled in only by this feature.
+//!
+//! `no_std` consumers build with `default-features = false, features = ["libm"]`. At least
+//! one of the two features must be enabled.
 
 #![forbid(unsafe_code)]
+#![no_std]
+
+// `Bobyqa` owns its buffers (allocated once in `new`), so the crate needs `alloc` but not `std`
+// (no_std spec D1). `std` is linked only for the default-on `std` feature (the `Error` impl)
+// and for tests, which always build with std.
+extern crate alloc;
+#[cfg(any(feature = "std", test))]
+extern crate std;
 
 mod bobyqb;
 mod consts;
@@ -43,6 +63,7 @@ mod trustregion;
 mod update;
 mod util;
 
+use alloc::vec::Vec;
 use consts::{
     BOUNDMAX, ETA1_DFT, ETA2_DFT, GAMMA1_DFT, GAMMA2_DFT, MAXFUN_DIM_DFT, RHOBEG_DFT, RHOEND_DFT,
 };
@@ -66,7 +87,8 @@ pub struct Config {
     /// Objective-evaluation budget — must exceed `npt` (default `500 * n`).
     pub max_fun: usize,
     /// Stop as soon as an evaluation reaches `f <= f_target` (default `-inf`: disabled).
-    /// NaN is rejected by [`Bobyqa::new`].
+    /// NaN and `+inf` are rejected by [`Bobyqa::new`] (a `+inf` target would "succeed"
+    /// on the first evaluation).
     pub f_target: f64,
     /// Restart schedule. `None` (the default) is plain BOBYQA — bit-identical to 0.1.x:
     /// the solve ends the moment `rho` reaches `rho_end`. `Some` starts a new cycle instead:
@@ -74,27 +96,59 @@ pub struct Config {
     /// around the best point found — see [`RestartConfig`] for what triggers that and what
     /// stops it. `max_fun` stays the TOTAL evaluation budget across all cycles.
     pub restart: Option<RestartConfig>,
+    /// Opt-in f-tolerance stopping (ftol spec): stop when the best f improves by less than
+    /// `ftol_rel * max(|f_best|, 1.0) + ftol_abs` over one full rho stage. `None` (the
+    /// default) keeps exact PRIMA behavior — the check is not even reached, so the default
+    /// path stays bit-identical.
+    ///
+    /// Semantics vs [`f_target`](Self::f_target): `f_target` is "stop when f is good enough
+    /// in absolute terms"; `ftol` is "stop when f stops improving". The check runs at
+    /// **stage granularity** — only where the solver is about to shrink `rho` — so a
+    /// single micro-kink iteration cannot trigger it, and it never fires during the first
+    /// rho stage or once `rho` has reached `rho_end` (the ladder finishing is
+    /// [`Status::Converged`], as today). A triggered stop returns
+    /// [`Status::FtolReached`] — a converged-class outcome that does not trigger a
+    /// [`Config::restart`] cycle; when both are configured and both would fire at the same
+    /// rho reduction, `ftol` wins and the solve stops.
+    ///
+    /// If `Some`, the value must be finite and `>= 0.0` (`Some(0.0)` is legal: stops only
+    /// on exact stagnation).
+    pub ftol_rel: Option<f64>,
+    /// Absolute part of the `ftol` test — see [`ftol_rel`](Self::ftol_rel). Same validation:
+    /// if `Some`, finite and `>= 0.0`. Either field alone enables the check (the missing
+    /// one contributes 0).
+    pub ftol_abs: Option<f64>,
 }
 
 impl Config {
     /// PRIMA's defaults for an `n`-dimensional problem.
+    ///
+    /// The two derived defaults saturate instead of overflowing on absurd `n`
+    /// (safe-checks spec S1): a saturated `npt`/`max_fun` then fails [`Bobyqa::new`]'s
+    /// range checks, so no panic and no wrapped size can escape.
     #[must_use]
     pub fn new(n: usize) -> Self {
         Self {
-            npt: 2 * n + 1,
+            npt: n.saturating_mul(2).saturating_add(1),
             rho_begin: RHOBEG_DFT,
             rho_end: RHOEND_DFT,
-            max_fun: MAXFUN_DIM_DFT * n,
+            max_fun: MAXFUN_DIM_DFT.saturating_mul(n),
             // PRIMA's FTARGET_DFT is -REALMAX, which would terminate on f = -REALMAX;
             // -inf is strictly "off" (design §4.2).
             f_target: f64::NEG_INFINITY,
             // Off by default (stall-restart spec D5): existing users' numerics must not move.
             restart: None,
+            // Off by default (ftol spec §0 risk 2): None must be bit-identical to today.
+            ftol_rel: None,
+            ftol_abs: None,
         }
     }
 }
 
 /// Why the solver stopped (or why construction failed).
+///
+/// Implements [`Display`](core::fmt::Display) unconditionally; the `std::error::Error` impl
+/// requires the (default-on) `std` cargo feature, so `no_std` builds keep `Display` only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
     /// The trust-region radius reached `rho_end`, with any restart schedule settled there —
@@ -105,12 +159,21 @@ pub enum Status {
     Converged,
     /// An evaluation reached `f_target`.
     TargetReached,
+    /// The best f improved by less than the configured [`Config::ftol_rel`]/
+    /// [`Config::ftol_abs`] tolerance over one full rho stage — a converged-class outcome
+    /// (the fit stopped improving on the caller's own f-scale before the rho ladder
+    /// finished). Only reachable when at least one `ftol` field is set.
+    FtolReached,
     /// The `max_fun` evaluation budget was exhausted.
     MaxFunReached,
     /// The rescue procedure could not restore the interpolation geometry.
     ModelDegenerate,
     /// Bad bounds, `npt`, or slice sizes.
     InvalidArgs,
+    /// [`Bobyqa::new`] could not allocate the solver workspace (safe-checks spec S2):
+    /// the allocator refused the request, or a buffer's byte size overflowed `isize`.
+    /// Construction-time only — a built solver never allocates again.
+    AllocationFailed,
 }
 
 impl core::fmt::Display for Status {
@@ -120,13 +183,20 @@ impl core::fmt::Display for Status {
                 "the trust-region radius reached rho_end, with any restart schedule settled"
             }
             Status::TargetReached => "an evaluation reached f_target",
+            Status::FtolReached => {
+                "the best f improved by less than the ftol tolerance over one rho stage"
+            }
             Status::MaxFunReached => "the max_fun evaluation budget was exhausted",
             Status::ModelDegenerate => "the interpolation model degenerated beyond rescue",
             Status::InvalidArgs => "invalid arguments: bad bounds, npt, sizes, or config",
+            Status::AllocationFailed => "the solver workspace could not be allocated",
         })
     }
 }
 
+// `Error` requires the (default-on) `std` feature; under `no_std` builds the impl is absent
+// and `Status` keeps its `core`-only `Display`.
+#[cfg(feature = "std")]
 impl std::error::Error for Status {}
 
 /// PRIMA's moderated-extreme-barrier ceiling (`consts.F90` L169, `10^min(30, range/2)`
@@ -196,20 +266,41 @@ impl Bobyqa {
     ///
     /// # Errors
     ///
-    /// [`Status::InvalidArgs`] when `(n, config)` is rejected: `n = 0`; `npt`
+    /// [`Status::InvalidArgs`] when `(n, config)` is rejected: `n = 0`; an `(n, npt)`
+    /// whose workspace dimensions would overflow `usize` (safe-checks spec S1); `npt`
     /// outside `n + 2 ..= (n + 1)(n + 2) / 2` (PRIMA's preprocessing would
     /// clamp; we reject); `rho_begin` not a positive finite number; `rho_end`
     /// not in `(0, rho_begin]`; `max_fun <= npt` (PRIMA preproc would raise; we
-    /// reject); `f_target` NaN. With `restart` set, additionally: `max_restarts`
-    /// zero; `improve_rel_tol` negative or NaN; `cycle_budget_frac` outside
-    /// `[0.0, 1.0]` or NaN.
+    /// reject); `f_target` NaN or `+inf` (a `+inf` target would "succeed" on the first
+    /// evaluation); `ftol_rel`/`ftol_abs` set but not a finite value `>= 0.0`. With
+    /// `restart` set, additionally: `max_restarts`
+    /// zero or above [`MAX_RESTARTS_CAP`]; `improve_rel_tol` negative or NaN;
+    /// `cycle_budget_frac` outside `[0.0, 1.0]` or NaN.
+    ///
+    /// [`Status::AllocationFailed`] when the workspace allocation itself fails
+    /// (safe-checks spec S2) — the allocator refused, or a buffer's byte size overflowed
+    /// `isize`. The workspace is
+    /// `(npt + 13)(npt + n) + 3n(n + 5)/2` doubles by Powell's working-space bound, plus
+    /// this port's hoisted per-call scratch of the same order — roughly `O(npt^2 + n*npt)`
+    /// f64s overall (about 6 GB at `n = 10_000` with the default `npt = 2n + 1`) — so
+    /// callers on big problems can budget before constructing.
     ///
     /// # Panics
     ///
-    /// Never — invalid `(n, config)` is reported through [`Status::InvalidArgs`].
+    /// Never — invalid `(n, config)` is reported through [`Status::InvalidArgs`] and an
+    /// unsatisfiable allocation through [`Status::AllocationFailed`].
     #[expect(clippy::neg_cmp_op_on_partial_ord)] // `!(a >= b)` is load-bearing for NaN — never `a < b`
     pub fn new(n: usize, config: Config) -> Result<Self, Status> {
         if n == 0 {
+            return Err(Status::InvalidArgs);
+        }
+        // The S1 overflow gate, deliberately FIRST after `n == 0`: the range checks below
+        // (`n + 2`, `(n + 1)(n + 2) / 2`, `npt + 1`) and every workspace-buffer size
+        // (`Mat::try_zeros` products, `2 * n + 1` in `SolverWs::new` — bounded by `npt + n`
+        // once `npt >= n + 2` holds) compute unchecked arithmetic that is safe only once
+        // this gate has passed. `Mat` indexing stays unchecked by the same reasoning:
+        // overflowing sizes are unreachable past this point.
+        if !ws_dims_ok(n, config.npt) {
             return Err(Status::InvalidArgs);
         }
         if config.npt < n + 2 {
@@ -227,11 +318,20 @@ impl Bobyqa {
         if config.max_fun < config.npt + 1 {
             return Err(Status::InvalidArgs);
         }
-        if config.f_target.is_nan() {
+        // NaN and +inf are both rejected (safe-checks spec S3.2): a target of +inf is never
+        // meaningful — the very first (moderated, hence finite) evaluation would "reach" it.
+        if config.f_target.is_nan() || config.f_target == f64::INFINITY {
             return Err(Status::InvalidArgs);
         }
+        // ftol spec §1: each field, if set, must be finite and >= 0 (0.0 is legal — stops
+        // only on exact stagnation). NaN fails the `>= 0.0` half of the test.
+        for tol in [config.ftol_rel, config.ftol_abs].into_iter().flatten() {
+            if !(tol.is_finite() && tol >= 0.0) {
+                return Err(Status::InvalidArgs);
+            }
+        }
         if let Some(restart) = config.restart {
-            if restart.max_restarts < 1 {
+            if restart.max_restarts < 1 || restart.max_restarts > MAX_RESTARTS_CAP {
                 return Err(Status::InvalidArgs);
             }
             if !(restart.improve_rel_tol >= 0.0) {
@@ -245,12 +345,14 @@ impl Bobyqa {
         Ok(Self {
             n,
             config,
-            ws: bobyqb::SolverWs::new(n, config.npt),
+            ws: bobyqb::SolverWs::new(n, config.npt).map_err(|_| Status::AllocationFailed)?,
             last_restarts: 0,
             // The per-cycle instrumentation store (stall-restart spec §5): one slot per
             // possible restart plus one spare, so `minimize` fills it without reallocating.
+            // `max_restarts <= MAX_RESTARTS_CAP` above keeps the `+ 1` overflow-free.
             cycle_boundaries: match config.restart {
-                Some(restart) => Vec::with_capacity(restart.max_restarts + 1),
+                Some(restart) => util::try_capacity(restart.max_restarts + 1)
+                    .map_err(|_| Status::AllocationFailed)?,
                 None => Vec::new(),
             },
         })
@@ -310,6 +412,16 @@ impl Bobyqa {
             cycle_boundaries: core::mem::take(&mut self.cycle_boundaries),
         });
         let mut f = f;
+        // ftol spec §2 shape guard: both-None must not even reach the check site — the
+        // engine takes `None` and the default path is the literal existing code.
+        let ftol = if self.config.ftol_rel.is_none() && self.config.ftol_abs.is_none() {
+            None
+        } else {
+            Some((
+                self.config.ftol_rel.unwrap_or(0.0),
+                self.config.ftol_abs.unwrap_or(0.0),
+            ))
+        };
         let (fopt, nf, info) = bobyqb::bobyqb(
             &mut f,
             self.config.max_fun,
@@ -317,6 +429,7 @@ impl Bobyqa {
             ETA1_DFT,
             ETA2_DFT,
             self.config.f_target,
+            ftol,
             GAMMA1_DFT,
             GAMMA2_DFT,
             rhobeg,
@@ -395,6 +508,31 @@ pub fn bobyqa<F: FnMut(&[f64]) -> f64>(
             status,
         },
     }
+}
+
+/// Upper bound on [`RestartConfig::max_restarts`] (safe-checks spec S2): far above any real
+/// schedule (the recommended one is `1`), it exists so the `max_restarts + 1` instrumentation
+/// store can neither overflow nor become a caller-sized giant allocation.
+pub const MAX_RESTARTS_CAP: usize = 10_000;
+
+// The S1 overflow gate (safe-checks spec): every add/product any workspace buffer will
+// compute, checked end to end. Sums are checked BEFORE their products — `npt + n`, `n + 1`,
+// `n + 2` can each wrap before a `checked_mul` ever runs (e.g. `n = usize::MAX - 1` makes
+// `n + 2` wrap to 0). On 32-bit targets (wasm32, thumbv7em) this is what stands between a
+// large `n` and a wrapped `Mat` size that stays in-bounds and returns garbage silently;
+// PRIMA guards the same class in preproc.f90 L197.
+fn ws_dims_ok(n: usize, npt: usize) -> bool {
+    n.checked_add(1)
+        .zip(n.checked_add(2))
+        .and_then(|(a, b)| a.checked_mul(b)) // the npt cap formula (n + 1)(n + 2)
+        .is_some()
+        && npt
+            .checked_add(n) // npt + n itself (vlag/bmat cols), then (npt + n) * n (bmat)
+            .and_then(|s| s.checked_mul(n))
+            .is_some()
+        && npt.checked_mul(npt).is_some() // dominates zmat's npt * (npt - n - 1)
+        && npt.checked_mul(n).is_some() // xpt
+        && n.checked_mul(n).is_some() // hq
 }
 
 // The per-call checks: slice lengths; bounds NaN-free, ordered, and at least
@@ -479,10 +617,16 @@ fn prepare_call(
 /// `Config::max_fun` stays the TOTAL evaluation budget across all restarts.
 /// Start from [`RestartConfig::new`] and assign fields to override
 /// (`#[non_exhaustive]`, like [`Config`]).
+///
+/// Interaction with [`Config::ftol_rel`]/[`Config::ftol_abs`]: a triggered ftol stop
+/// ([`Status::FtolReached`]) is a converged-class outcome and does not spend a restart
+/// cycle — when both are configured and both would fire at the same rho reduction, ftol
+/// wins and the solve stops.
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
 pub struct RestartConfig {
-    /// Cap on restarts before returning the last cycle's result. The recommended schedule
+    /// Cap on restarts before returning the last cycle's result — at least 1 and at most
+    /// [`MAX_RESTARTS_CAP`] ([`Bobyqa::new`] rejects both extremes). The recommended schedule
     /// pairs this at `1` with [`cycle_budget_frac`](Self::cycle_budget_frac) `0.125`: a long
     /// schedule divides a fixed `max_fun` into cycles too short to descend, so each one
     /// rebuilds a model it then cannot exploit.
@@ -561,12 +705,13 @@ impl Default for RestartConfig {
 // PRIMA's infos.f90, so it is absent here.
 fn status_from_info(info: i32) -> Status {
     use crate::consts::{
-        DAMAGING_ROUNDING, FTARGET_ACHIEVED, MAXFUN_REACHED, MAXTR_REACHED, NAN_INF_F,
-        NAN_INF_MODEL, NAN_INF_X, SMALL_TR_RADIUS,
+        DAMAGING_ROUNDING, FTARGET_ACHIEVED, FTOL_REACHED, MAXFUN_REACHED, MAXTR_REACHED,
+        NAN_INF_F, NAN_INF_MODEL, NAN_INF_X, SMALL_TR_RADIUS,
     };
     match info {
         SMALL_TR_RADIUS => Status::Converged,
         FTARGET_ACHIEVED => Status::TargetReached,
+        FTOL_REACHED => Status::FtolReached,
         MAXFUN_REACHED | MAXTR_REACHED => Status::MaxFunReached,
         NAN_INF_MODEL | DAMAGING_ROUNDING | NAN_INF_X | NAN_INF_F => Status::ModelDegenerate,
         // bobyqb's info set is closed; a new code here is a port bug or a spec amendment to
@@ -594,6 +739,57 @@ mod tests {
         assert_eq!(c.rho_end, 1e-6);
         assert_eq!(c.max_fun, 1500); // 500 * n
         assert_eq!(c.f_target, f64::NEG_INFINITY);
+        assert_eq!(c.ftol_rel, None); // ftol off by default (spec §0 risk 2)
+        assert_eq!(c.ftol_abs, None);
+    }
+
+    #[test]
+    fn new_rejects_bad_ftol_values_and_accepts_zero() {
+        let (n, c) = valid();
+        for bad in [f64::NAN, -1.0, f64::INFINITY] {
+            assert!(
+                Bobyqa::new(
+                    n,
+                    Config {
+                        ftol_rel: Some(bad),
+                        ..c
+                    }
+                )
+                .is_err()
+            );
+            assert!(
+                Bobyqa::new(
+                    n,
+                    Config {
+                        ftol_abs: Some(bad),
+                        ..c
+                    }
+                )
+                .is_err()
+            );
+        }
+        // Some(0.0) is legal (stops only on exact stagnation), alone or together.
+        assert!(
+            Bobyqa::new(
+                n,
+                Config {
+                    ftol_rel: Some(0.0),
+                    ftol_abs: Some(0.0),
+                    ..c
+                }
+            )
+            .is_ok()
+        );
+        assert!(
+            Bobyqa::new(
+                n,
+                Config {
+                    ftol_abs: Some(1e-8),
+                    ..c
+                }
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -654,6 +850,85 @@ mod tests {
             )
             .is_err()
         );
+        // f_target = +inf would "succeed" on the first evaluation (S3.2) — rejected like NaN;
+        // -inf stays the documented "off" default and must keep passing.
+        assert!(
+            Bobyqa::new(
+                n,
+                Config {
+                    f_target: f64::INFINITY,
+                    ..c
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            Bobyqa::new(
+                n,
+                Config {
+                    f_target: f64::NEG_INFINITY,
+                    ..c
+                }
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn ws_dims_ok_rejects_overflowing_dimension_arithmetic() {
+        // Realistic shapes pass, including the npt cap boundary.
+        assert!(ws_dims_ok(2, 5));
+        assert!(ws_dims_ok(100, 101 * 102 / 2));
+        // n + 2 wraps to 0 BEFORE any product — the checked-add-then-mul chain must catch it.
+        assert!(!ws_dims_ok(usize::MAX - 1, 5));
+        assert!(!ws_dims_ok(usize::MAX, usize::MAX));
+        // npt-driven overflows: npt * npt and npt + n.
+        assert!(!ws_dims_ok(2, usize::MAX));
+        assert!(!ws_dims_ok(2, usize::MAX / 2));
+        // n * n overflow at the half-width boundary.
+        assert!(!ws_dims_ok(1_usize << (usize::BITS / 2), 5));
+    }
+
+    #[test]
+    fn new_rejects_dimension_overflow_instead_of_panicking() {
+        // Config::new saturates its derived npt/max_fun; the S1 gate (or the range checks
+        // the saturation then fails) must reject — in debug builds a panic here is the bug.
+        for n in [usize::MAX, usize::MAX - 1, usize::MAX / 2] {
+            assert!(matches!(
+                Bobyqa::new(n, Config::new(n)),
+                Err(Status::InvalidArgs)
+            ));
+        }
+        // A hand-built config with an overflowing npt, past the saturation path.
+        let mut c = Config::new(2);
+        c.npt = usize::MAX;
+        c.max_fun = usize::MAX;
+        assert!(matches!(Bobyqa::new(2, c), Err(Status::InvalidArgs)));
+    }
+
+    // The S1 conditions are untestable with real allocations on 64-bit hosts; this runs on
+    // CI's wasm32 job (safe-checks spec S3.3): default npt at n = 65_535 makes npt * npt
+    // (and the npt cap formula) overflow 32-bit usize.
+    #[test]
+    #[cfg(target_pointer_width = "32")]
+    fn new_rejects_sizes_that_overflow_32bit_usize() {
+        let n = 65_535;
+        assert!(matches!(
+            Bobyqa::new(n, Config::new(n)),
+            Err(Status::InvalidArgs)
+        ));
+    }
+
+    #[test]
+    #[ignore = "allocates (or cleanly fails to allocate) a multi-GB workspace; run explicitly"]
+    fn new_reports_allocation_failure_instead_of_aborting() {
+        // n = 10_000 at the default npt = 2n + 1 wants ~6 GB of f64 workspace (S2). Whether
+        // that fits is the platform's business — the contract under test is only: `Ok` or
+        // `AllocationFailed`, never an abort and never another rejection.
+        match Bobyqa::new(10_000, Config::new(10_000)) {
+            Ok(_) | Err(Status::AllocationFailed) => {}
+            Err(other) => panic!("unexpected rejection: {other:?}"),
+        }
     }
 
     fn invalid_outcome(o: Outcome) {
@@ -824,6 +1099,7 @@ mod tests {
         use crate::consts::*;
         assert_eq!(status_from_info(SMALL_TR_RADIUS), Status::Converged);
         assert_eq!(status_from_info(FTARGET_ACHIEVED), Status::TargetReached);
+        assert_eq!(status_from_info(FTOL_REACHED), Status::FtolReached);
         assert_eq!(status_from_info(MAXFUN_REACHED), Status::MaxFunReached);
         assert_eq!(status_from_info(MAXTR_REACHED), Status::MaxFunReached);
         assert_eq!(status_from_info(NAN_INF_MODEL), Status::ModelDegenerate);
@@ -833,7 +1109,9 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "std")]
     fn status_displays_and_is_an_error() {
+        use alloc::string::ToString;
         let e: &dyn std::error::Error = &Status::InvalidArgs;
         assert!(!e.to_string().is_empty());
     }
@@ -863,6 +1141,20 @@ mod tests {
         // max_restarts >= 1
         assert!(!ok(RestartConfig {
             max_restarts: 0,
+            ..r
+        }));
+        // max_restarts <= MAX_RESTARTS_CAP (S2: kills both the `+ 1` overflow and the
+        // caller-sized giant boundary store); the cap itself is legal.
+        assert!(!ok(RestartConfig {
+            max_restarts: usize::MAX,
+            ..r
+        }));
+        assert!(!ok(RestartConfig {
+            max_restarts: MAX_RESTARTS_CAP + 1,
+            ..r
+        }));
+        assert!(ok(RestartConfig {
+            max_restarts: MAX_RESTARTS_CAP,
             ..r
         }));
         // improve_rel_tol >= 0
