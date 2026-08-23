@@ -566,7 +566,7 @@ fn errbd(
     }
     // BSECOND is fully overwritten below — no zeroing needed.
     for i in 0..n {
-        bsecond[i] = 0.5 * (hq[[i, i]] + v[i]) * rhosq;
+        bsecond[i] = f64::midpoint(hq[[i, i]], v[i]) * rhosq;
     }
 
     // PRIMA bobyqb.f90 L772: EBOUND = MINVAL(MAX(BFIRST, BFIRST + BSECOND)) — ascending min.

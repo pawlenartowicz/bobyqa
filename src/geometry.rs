@@ -764,21 +764,20 @@ pub(crate) fn geostep(
             curv = -curv;
         }
 
-        let vlagsq: f64;
         // PRIMA geometry.f90 L567: take the shortened step xopt + (−gs/curv)·s instead of the full
         // step when its scaling −gs/curv lies in (0, 1) and yields a larger |Lagrange| along S (the
         // Lagrange function is gs·t + ½·curv·t²); curv < −(1+√2)·gs is exactly that crossover.
-        if curv > -gs && curv < -(1.0 + math::sqrt(2.0)) * gs {
+        let vlagsq: f64 = if curv > -gs && curv < -(1.0 + math::sqrt(2.0)) * gs {
             let scaling = -gs / curv;
             for i in 0..n {
                 x[i] = (xopt[i] + scaling * s[i]).min(su[i]).max(sl[i]);
             }
             let half_gs_scaling = 0.5 * gs * scaling;
-            vlagsq = half_gs_scaling * half_gs_scaling;
+            half_gs_scaling * half_gs_scaling
         } else {
             let t = gs + 0.5 * curv;
-            vlagsq = t * t;
-        }
+            t * t
+        };
 
         // PRIMA geometry.f90 L575–578: keep the better xcauchy
         if vlagsq > vlagsq_cauchy {
