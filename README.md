@@ -8,7 +8,7 @@
 **Minimize a function from values alone — no derivatives — subject to box bounds.** A pure-Rust,
 dependency-free-by-default, `no_std`-compatible port of M. J. D. Powell's **BOBYQA** (Bound Optimization BY Quadratic
 Approximation), transcribed from [PRIMA](https://github.com/libprima/prima)  — see [Design](#design).
-As of 2026-06 there is no other pure-Rust BOBYQA on crates.io; the alternatives are all C-library bindings.
+[How it compares](#how-it-compares) sets it against the alternatives.
 
 The solver itself is a faithful port. On top of it sits one optional, off-by-default layer —
 [restarts](#restarts) — which is not part of BOBYQA as Powell published it; see
@@ -49,6 +49,31 @@ let outcome = solver.minimize(
 
 println!("f = {:.2e} at {:?} after {} evaluations", outcome.f, x, outcome.n_eval);
 ```
+
+## How it compares
+
+| | `bobyqa` (this crate) | [basin](https://crates.io/crates/basin) | [nlopt](https://crates.io/crates/nlopt) (`LN_BOBYQA`) |
+|---|---|---|---|
+| Implementation | pure Rust, this one algorithm | pure Rust, multi-solver framework | C library, statically linked |
+| Algorithm source | PRIMA (2026), bit-exact against its golden trajectories | ported from PRIMA v0.7.2; final-point parity to tolerance, trajectories diverge | C translation of Powell's 2009 Fortran |
+| Required dependencies | none (`libm` opt-in) | `rand` family, `num-traits`, `web-time` | C toolchain; bundles libnlopt |
+| WebAssembly | yes | yes | no |
+| `no_std` | yes (`alloc` + `libm`) | no | no |
+| License | MIT OR Apache-2.0 | MIT OR Apache-2.0 | LGPL as a combined work; the BOBYQA files themselves MIT |
+
+Speed: on a clock-locked machine over the standard test functions, this crate is
+**4.4–9.9× faster than PRIMA**with identical trajectories and evaluation
+counts, a reused `Bobyqa` against `prima_minimize`, which allocates and packs its
+workspace on every call. nlopt's C core is faster on cheap objectives, and the gap narrows
+as the objective grows more expensive.
+
+## Used by
+
+[GLMM](https://github.com/pawlenartowicz/glmm) — mixed-model fitting for Python and R over
+one Rust kernel — uses this crate as its optimizer. [MCPower](https://github.com/pawlenartowicz/MCPower)
+builds on GLMM: a power-analysis application that fits mixed models thousands of times per
+analysis, entirely in the browser — a production deployment of this crate compiled to
+WebAssembly.
 
 ## Restarts
 
