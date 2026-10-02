@@ -8,6 +8,7 @@
 //! `callback_fcn` are omitted; info codes are `consts.rs` values, mapped to the
 //! public `Status` in `lib.rs`.
 
+use crate::TrustRadius;
 use crate::consts::{
     DAMAGING_ROUNDING, FTOL_REACHED, INFO_DFT, MAXTR_REACHED, NAN_INF_F, NAN_INF_MODEL, NAN_INF_X,
     REALMAX, SMALL_TR_RADIUS,
@@ -26,6 +27,7 @@ use alloc::collections::TryReserveError;
 #[cfg(test)]
 use alloc::vec;
 use alloc::vec::Vec;
+use core::cell::Cell;
 
 /// PRIMA bobyqb.f90 L188: convergence tolerance of the trust-region subproblem solver.
 const TRTOL: f64 = 1.0e-2;
@@ -706,6 +708,16 @@ fn hard_rebuild<F: FnMut(&[f64]) -> f64>(
     subinfo
 }
 
+/// Writes the radii in force into `Bobyqa::minimize_with_radius`'s cell; a no-op for
+/// `Bobyqa::minimize`. Called before every objective evaluation the main loop makes (the
+/// opening `initxf` sees the cell's initial `(rho_begin, rho_begin)`).
+#[inline]
+fn publish(radius: Option<&Cell<TrustRadius>>, rho: f64, delta: f64) {
+    if let Some(cell) = radius {
+        cell.set(TrustRadius { rho, delta });
+    }
+}
+
 /// PRIMA bobyqb.f90 L46 `bobyqb`: the major calculations of BOBYQA. Returns `(f, nf, info)`;
 /// `x` is overwritten with the best point (in original coordinates).
 ///
@@ -738,6 +750,10 @@ pub(crate) fn bobyqb<F: FnMut(&[f64]) -> f64>(
     x: &mut [f64],
     ws: &mut SolverWs,
     mut restart: Option<&mut RestartState>,
+    // `Bobyqa::minimize_with_radius`: `(rho, delta)` published before every evaluation
+    // (`publish`), read by the caller's objective wrapper. Write-only here, so `None`
+    // (`Bobyqa::minimize`) and `Some` take the same path through the solve.
+    radius: Option<&Cell<TrustRadius>>,
 ) -> (f64, usize, i32) {
     let n = x.len();
 
@@ -927,6 +943,7 @@ pub(crate) fn bobyqb<F: FnMut(&[f64]) -> f64>(
                 // Re-widen exactly as the reduce_rho block resets, but back to rhobeg.
                 rho = rhobeg;
                 delta = rhobeg;
+                publish(radius, rho, delta);
                 dnorm_rec = [REALMAX; 2];
                 moderr_rec = [REALMAX; 2];
                 rs.on_restart(fopt, nf);
@@ -1037,6 +1054,7 @@ pub(crate) fn bobyqb<F: FnMut(&[f64]) -> f64>(
                 xnew[i] = xpt[[i, kopt]] + d[i];
             }
             xinbd_into(xbase, xnew, xl, xu, sl, su, x);
+            publish(radius, rho, delta);
             f = evaluate(calfun, x, xmod);
             nf += 1;
             rescued = false;
@@ -1095,6 +1113,7 @@ pub(crate) fn bobyqb<F: FnMut(&[f64]) -> f64>(
                     info = DAMAGING_ROUNDING; // the last RESCUE did not improve the situation.
                     break;
                 }
+                publish(radius, rho, delta);
                 subinfo = rescue(
                     calfun, maxfun, delta, ftarget, xl, xu, &mut kopt, &mut nf, fval, gopt, hq, pq,
                     sl, su, xbase, xpt, bmat, zmat, rws,
@@ -1252,6 +1271,7 @@ pub(crate) fn bobyqb<F: FnMut(&[f64]) -> f64>(
                     info = DAMAGING_ROUNDING; // the last RESCUE did not improve the situation.
                     break;
                 }
+                publish(radius, rho, delta);
                 subinfo = rescue(
                     calfun, maxfun, delta, ftarget, xl, xu, &mut kopt, &mut nf, fval, gopt, hq, pq,
                     sl, su, xbase, xpt, bmat, zmat, rws,
@@ -1269,6 +1289,7 @@ pub(crate) fn bobyqb<F: FnMut(&[f64]) -> f64>(
                     xnew[i] = xpt[[i, kopt]] + d[i];
                 }
                 xinbd_into(xbase, xnew, xl, xu, sl, su, x);
+                publish(radius, rho, delta);
                 f = evaluate(calfun, x, xmod);
                 nf += 1;
                 rescued = false;
@@ -1431,6 +1452,7 @@ pub(crate) fn bobyqb<F: FnMut(&[f64]) -> f64>(
             xnew[i] = xpt[[i, kopt]] + d[i];
         }
         xinbd_into(xbase, xnew, xl, xu, sl, su, x);
+        publish(radius, rho, delta);
         f = evaluate(calfun, x, xmod);
         nf += 1;
         // PRIMA L656-660: fmsg/savehist omitted.
@@ -1510,6 +1532,7 @@ mod tests {
             1e-6,
             &mut x,
             &mut ws,
+            None,
             None,
         );
         assert_eq!(info, SMALL_TR_RADIUS);

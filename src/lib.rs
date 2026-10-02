@@ -67,6 +67,7 @@ use alloc::vec::Vec;
 use consts::{
     BOUNDMAX, ETA1_DFT, ETA2_DFT, GAMMA1_DFT, GAMMA2_DFT, MAXFUN_DIM_DFT, RHOBEG_DFT, RHOEND_DFT,
 };
+use core::cell::Cell;
 use util::moderatex1;
 
 /// Tuning knobs for [`Bobyqa`]. No `Default`: `npt`'s default (`2n + 1`) needs `n` —
@@ -214,7 +215,7 @@ impl std::error::Error for Status {}
 /// never left an infeasible region.
 pub const FUNCMAX: f64 = consts::FUNCMAX;
 
-/// The result of one [`Bobyqa::minimize`] call.
+/// The result of one [`Bobyqa::minimize`] or [`Bobyqa::minimize_with_radius`] call.
 #[derive(Debug, Clone, Copy)]
 pub struct Outcome {
     /// Best objective value found. `NaN` when `status` is [`Status::InvalidArgs`] —
@@ -241,6 +242,23 @@ impl Outcome {
     pub fn found_finite(&self) -> bool {
         self.f < FUNCMAX
     }
+}
+
+/// The trust-region radii in force when the solver requests an evaluation, handed to the
+/// objective of [`Bobyqa::minimize_with_radius`].
+///
+/// `rho` is the lower bound on the trust-region radius (PRIMA's `RHO`): it starts at
+/// [`Config::rho_begin`], never increases within a cycle, and ends at or above
+/// [`Config::rho_end`] (a restart sets it back to `rho_begin`). `delta` is the current
+/// trust-region radius (PRIMA's `DELTA`), always `>= rho`. Callers use them to set the
+/// accuracy of an inexact objective: a value error far below `rho^2` is wasted on the model.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
+pub struct TrustRadius {
+    /// Lower bound on the trust-region radius (PRIMA `RHO`).
+    pub rho: f64,
+    /// Current trust-region radius (PRIMA `DELTA`).
+    pub delta: f64,
 }
 
 /// A reusable BOBYQA solver: holds every buffer the algorithm needs, built
@@ -388,6 +406,70 @@ impl Bobyqa {
         lower: &[f64],
         upper: &[f64],
     ) -> Outcome {
+        self.run(f, x, lower, upper, None)
+    }
+
+    /// [`Bobyqa::minimize`] with an objective that also receives the current
+    /// [`TrustRadius`] at each evaluation, for objectives whose own accuracy can follow
+    /// the solver's resolution (an inner solve run looser while `rho` is large).
+    ///
+    /// The algorithm is the same: an objective that ignores its second argument gets the
+    /// same `x`, [`Outcome`] and evaluation sequence as [`Bobyqa::minimize`], bit for bit.
+    /// No heap allocation in this call.
+    ///
+    /// # Panics
+    ///
+    /// Never on numerical input, as [`Bobyqa::minimize`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bobyqa::{Bobyqa, Config};
+    /// let mut solver = Bobyqa::new(2, Config::new(2)).unwrap();
+    /// let mut x = [1.0, 2.0];
+    /// let mut smallest_rho = f64::INFINITY;
+    /// let outcome = solver.minimize_with_radius(
+    ///     |p: &[f64], radius| {
+    ///         smallest_rho = smallest_rho.min(radius.rho);
+    ///         p.iter().map(|v| v * v).sum::<f64>()
+    ///     },
+    ///     &mut x,
+    ///     &[-5.0, -5.0],
+    ///     &[5.0, 5.0],
+    /// );
+    /// assert!(outcome.f < 1e-8);
+    /// assert_eq!(smallest_rho, 1e-6); // reached rho_end
+    /// ```
+    pub fn minimize_with_radius<F: FnMut(&[f64], TrustRadius) -> f64>(
+        &mut self,
+        mut f: F,
+        x: &mut [f64],
+        lower: &[f64],
+        upper: &[f64],
+    ) -> Outcome {
+        let radius = Cell::new(TrustRadius {
+            rho: self.config.rho_begin,
+            delta: self.config.rho_begin,
+        });
+        self.run(
+            |p: &[f64]| f(p, radius.get()),
+            x,
+            lower,
+            upper,
+            Some(&radius),
+        )
+    }
+
+    /// The body of both entry points. `radius`, when set, is written by the engine with the
+    /// current `(rho, delta)` before every evaluation; it never feeds back into the solve.
+    fn run<F: FnMut(&[f64]) -> f64>(
+        &mut self,
+        f: F,
+        x: &mut [f64],
+        lower: &[f64],
+        upper: &[f64],
+        radius: Option<&Cell<TrustRadius>>,
+    ) -> Outcome {
         self.last_restarts = 0;
         self.cycle_boundaries.clear();
         if !prepare_call(self.n, &self.config, &mut self.ws, x, lower, upper) {
@@ -437,6 +519,7 @@ impl Bobyqa {
             x,
             &mut self.ws,
             restart_state.as_mut(),
+            radius,
         );
         if let Some(rs) = restart_state {
             self.last_restarts = rs.restarts_done;
@@ -449,17 +532,17 @@ impl Bobyqa {
         }
     }
 
-    /// Restarts performed on the last [`Bobyqa::minimize`] call — always 0 when
-    /// [`Config::restart`] is `None` (and before the first call).
+    /// Restarts performed on the last [`Bobyqa::minimize`] or [`Bobyqa::minimize_with_radius`]
+    /// call — always 0 when [`Config::restart`] is `None` (and before the first call).
     #[must_use]
     pub fn last_restart_count(&self) -> usize {
         self.last_restarts
     }
 
     /// Cumulative evaluation count at each restart boundary of the last [`Bobyqa::minimize`]
-    /// call — one entry per restart, so empty when none fired (and always empty when
-    /// [`Config::restart`] is `None`). Diff each entry against the next (the last against
-    /// [`Outcome::n_eval`]) for per-cycle evaluation costs.
+    /// or [`Bobyqa::minimize_with_radius`] call — one entry per restart, so empty when none
+    /// fired (and always empty when [`Config::restart`] is `None`). Diff each entry against
+    /// the next (the last against [`Outcome::n_eval`]) for per-cycle evaluation costs.
     #[must_use]
     pub fn last_cycle_boundaries(&self) -> &[usize] {
         &self.cycle_boundaries

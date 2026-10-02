@@ -5,6 +5,20 @@ All notable changes to this crate are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] — 2026-10-02
+
+Additive only: `Bobyqa::minimize` and `bobyqa(...)` are unchanged, bit for bit.
+
+### Added
+
+- **`Bobyqa::minimize_with_radius`** and the `TrustRadius { rho, delta }` it hands the
+  objective (`FnMut(&[f64], TrustRadius) -> f64`): the trust-region radii in force at each
+  evaluation, for objectives whose own accuracy can follow the solver's resolution (an inner
+  solve run looser while `rho` is large, as in Ehrhardt and Roberts 2021's inexact DFO). The
+  engine only writes the radii into a stack `Cell` before each evaluation; nothing reads them
+  back, so the solve is `minimize`'s (`tests/radius.rs`), and the call stays allocation-free
+  (`tests/alloc.rs`). `TrustRadius` is `#[non_exhaustive]`.
+
 ## [0.3.0] — 2026-08-19
 
 A default-features build with a default `Config` is unchanged by this release: std math, the
@@ -171,6 +185,8 @@ Initial release.
   only); deterministic — no RNG, global state, threads, or I/O; invalid
   arguments are returned as a `Status`, never panicked.
 
+[0.3.1]: https://github.com/pawlenartowicz/bobyqa/releases/tag/v0.3.1
+[0.3.0]: https://github.com/pawlenartowicz/bobyqa/releases/tag/v0.3.0
 [0.2.0]: https://github.com/pawlenartowicz/bobyqa/releases/tag/v0.2.0
 [0.1.3]: https://github.com/pawlenartowicz/bobyqa/releases/tag/v0.1.3
 [0.1.2]: https://github.com/pawlenartowicz/bobyqa/releases/tag/v0.1.2

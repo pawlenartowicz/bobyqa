@@ -92,6 +92,22 @@ fn minimize_allocates_zero_after_construction_on_warm_and_rescue_paths() {
         );
     }
 
+    // The radius-aware entry point shares that body; its radius cell lives on the stack.
+    let before = alloc_count();
+    let mut x = [1.0, 2.0];
+    let o = solver.minimize_with_radius(
+        |p: &[f64], _| p.iter().map(|v| v * v).sum::<f64>(),
+        &mut x,
+        &[-5.0, -5.0],
+        &[5.0, 5.0],
+    );
+    assert_eq!(o.status, Status::Converged);
+    assert_eq!(
+        alloc_count(),
+        before,
+        "minimize_with_radius allocated (the zero-alloc warm path, SPEC §4)"
+    );
+
     // Rescue path: the `booth_rescue` golden's exact problem (booth, npt 5, rho 0.5 -> 1e-12,
     // x0 = 0, upper[1] = 2.5 pins the optimum to the bound; 40 evals, converged). The capture
     // was built as a rescue stressor, and the solver is deterministic, so this run takes the
