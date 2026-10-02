@@ -446,7 +446,7 @@ mod tests {
 
     #[test]
     fn setij_is_empty_at_powells_default_npt() {
-        assert!(setij(2, 5).is_empty());
+        assert_eq!(setij(2, 5), [] as [(usize, usize); 0]);
     }
 
     #[test]

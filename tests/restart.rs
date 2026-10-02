@@ -220,7 +220,7 @@ fn opening_solve_converging_before_rho_end_gives_zero_restarts_and_matches_resta
     let o = s.minimize(sphere, &mut x, &[-5.0, -5.0], &[5.0, 5.0]);
     assert_eq!(o.status, Status::TargetReached);
     assert_eq!(s.last_restart_count(), 0);
-    assert!(s.last_cycle_boundaries().is_empty());
+    assert_eq!(s.last_cycle_boundaries(), []);
 
     // "Matches restart-off" in the strongest available sense: with the hook unreachable the two
     // configurations are the same engine on the same state, so every returned byte must agree.
@@ -684,5 +684,5 @@ fn restart_none_keeps_the_restart_accessors_empty() {
     let o = s.minimize(rosenbrock, &mut x, &[-5.0, -5.0], &[5.0, 5.0]);
     assert_eq!(o.status, Status::Converged);
     assert_eq!(s.last_restart_count(), 0);
-    assert!(s.last_cycle_boundaries().is_empty());
+    assert_eq!(s.last_cycle_boundaries(), []);
 }

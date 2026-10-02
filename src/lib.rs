@@ -1196,7 +1196,7 @@ mod tests {
     fn status_displays_and_is_an_error() {
         use alloc::string::ToString;
         let e: &dyn std::error::Error = &Status::InvalidArgs;
-        assert!(!e.to_string().is_empty());
+        assert_ne!(e.to_string(), "");
     }
 
     #[test]
@@ -1275,7 +1275,7 @@ mod tests {
     fn restart_accessors_are_empty_before_any_minimize() {
         let s = Bobyqa::new(2, with_restart(2, RestartConfig::new())).unwrap();
         assert_eq!(s.last_restart_count(), 0);
-        assert!(s.last_cycle_boundaries().is_empty());
+        assert_eq!(s.last_cycle_boundaries(), []);
     }
 
     #[test]
