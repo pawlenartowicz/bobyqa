@@ -3,7 +3,9 @@
 //! box-constrained local optimizer, ported from PRIMA's modern Fortran.
 //!
 //! Trajectory-parity-tested **bit-exact** against PRIMA (natively and on
-//! `wasm32-wasip1`).
+//! `wasm32-wasip1`) with [`Config::prima_parity`] set. The default differs from PRIMA
+//! only on a fully determined model (`npt = (n + 1)(n + 2) / 2`, so every `n = 1`
+//! problem), where PRIMA's RESCUE test fires on rounding alone; see that field.
 //!
 //! One public solver surface: [`Bobyqa`], the faithful PRIMA port. By default it
 //! stops as soon as `rho` reaches `rho_end`; setting [`Config::restart`] lets the
@@ -91,16 +93,16 @@ pub struct Config {
     /// NaN and `+inf` are rejected by [`Bobyqa::new`] (a `+inf` target would "succeed"
     /// on the first evaluation).
     pub f_target: f64,
-    /// Restart schedule. `None` (the default) is plain BOBYQA — bit-identical to 0.1.x:
-    /// the solve ends the moment `rho` reaches `rho_end`. `Some` starts a new cycle instead:
+    /// Restart schedule. `None` (the default) is plain BOBYQA: the solve ends the moment
+    /// `rho` reaches `rho_end`. `Some` starts a new cycle instead:
     /// `rho`/`delta` go back to `rho_begin` and the interpolation set is rebuilt from scratch
     /// around the best point found — see [`RestartConfig`] for what triggers that and what
     /// stops it. `max_fun` stays the TOTAL evaluation budget across all cycles.
     pub restart: Option<RestartConfig>,
     /// Opt-in f-tolerance stopping (ftol spec): stop when the best f improves by less than
-    /// `ftol_rel * max(|f_best|, 1.0) + ftol_abs` over one full rho stage. `None` (the
-    /// default) keeps exact PRIMA behavior — the check is not even reached, so the default
-    /// path stays bit-identical.
+    /// `ftol_rel * max(|f_best|, 1.0) + ftol_abs` over one full rho stage. With both `ftol`
+    /// fields `None` (the default) the check is off — it is not even reached, so it cannot
+    /// move the solve.
     ///
     /// Semantics vs [`f_target`](Self::f_target): `f_target` is "stop when f is good enough
     /// in absolute terms"; `ftol` is "stop when f stops improving". The check runs at
@@ -119,6 +121,21 @@ pub struct Config {
     /// if `Some`, finite and `>= 0.0`. Either field alone enables the check (the missing
     /// one contributes 0).
     pub ftol_abs: Option<f64>,
+    /// PRIMA parity switch. `false` (the default) applies this crate's deliberate deviations
+    /// from PRIMA; `true` reproduces PRIMA's BOBYQA bit for bit on every `n`.
+    ///
+    /// Today there is one deviation, and it applies only when `npt` is the maximum
+    /// `(n + 1)(n + 2) / 2`: the quadratic model is then fully determined by its points (and
+    /// at `n = 1` that maximum, 3, is the only legal `npt`). In that case the updating
+    /// formula's `beta` is zero in exact arithmetic, so each denominator `den[k]` equals
+    /// `vlag[k]^2` and PRIMA's test for calling RESCUE after a trust-region step,
+    /// `any(den > maxval(vlag^2))`, passes or fails on rounding alone. RESCUE then runs on
+    /// ordinary iterations and spends objective evaluations. With `prima_parity: false` that
+    /// test uses Powell's original factor, `any(den > 0.5 * maxval(vlag^2))` (PRIMA keeps it as
+    /// commented alternatives at `bobyqb.f90` L401-402), which still calls RESCUE on non-finite
+    /// values and on a denominator damaged well below `vlag^2`. Every `npt` below the maximum
+    /// runs PRIMA's code unchanged in both modes.
+    pub prima_parity: bool,
 }
 
 impl Config {
@@ -142,6 +159,10 @@ impl Config {
             // Off by default (ftol spec §0 risk 2): None must be bit-identical to today.
             ftol_rel: None,
             ftol_abs: None,
+            // Off: the deliberate deviations from PRIMA apply (see the field's docs). Changes
+            // results only for a fully determined model (`npt = (n + 1)(n + 2) / 2`, so every
+            // `n = 1` problem); everything else is bit-identical to `true`.
+            prima_parity: false,
         }
     }
 }
@@ -520,6 +541,9 @@ impl Bobyqa {
             &mut self.ws,
             restart_state.as_mut(),
             radius,
+            // `Config::prima_parity`: Powell's RESCUE factor on a fully determined
+            // model only. `false` here is the literal PRIMA path.
+            !self.config.prima_parity && self.config.npt == (self.n + 1) * (self.n + 2) / 2,
         );
         if let Some(rs) = restart_state {
             self.last_restarts = rs.restarts_done;
@@ -824,6 +848,7 @@ mod tests {
         assert_eq!(c.f_target, f64::NEG_INFINITY);
         assert_eq!(c.ftol_rel, None); // ftol off by default (spec §0 risk 2)
         assert_eq!(c.ftol_abs, None);
+        assert!(!c.prima_parity); // deviations on by default
     }
 
     #[test]
@@ -1003,15 +1028,17 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "allocates (or cleanly fails to allocate) a multi-GB workspace; run explicitly"]
+    #[cfg(target_pointer_width = "64")]
     fn new_reports_allocation_failure_instead_of_aborting() {
-        // n = 10_000 at the default npt = 2n + 1 wants ~6 GB of f64 workspace (S2). Whether
-        // that fits is the platform's business — the contract under test is only: `Ok` or
+        // n = 2^20 with npt = 2^31 passes every range check, and the first large buffer `new`
+        // asks for (bmat, n x (npt + n) f64) is 16 PB — more than a 64-bit address space
+        // hands out, so the request fails at once without touching memory. The contract:
         // `AllocationFailed`, never an abort and never another rejection.
-        match Bobyqa::new(10_000, Config::new(10_000)) {
-            Ok(_) | Err(Status::AllocationFailed) => {}
-            Err(other) => panic!("unexpected rejection: {other:?}"),
-        }
+        let n = 1 << 20;
+        let mut c = Config::new(n);
+        c.npt = 1 << 31;
+        c.max_fun = usize::MAX;
+        assert!(matches!(Bobyqa::new(n, c), Err(Status::AllocationFailed)));
     }
 
     fn invalid_outcome(o: Outcome) {
@@ -1195,8 +1222,36 @@ mod tests {
     #[cfg(feature = "std")]
     fn status_displays_and_is_an_error() {
         use alloc::string::ToString;
-        let e: &dyn std::error::Error = &Status::InvalidArgs;
-        assert_ne!(e.to_string(), "");
+        for (status, text) in [
+            (
+                Status::Converged,
+                "the trust-region radius reached rho_end, with any restart schedule settled",
+            ),
+            (Status::TargetReached, "an evaluation reached f_target"),
+            (
+                Status::FtolReached,
+                "the best f improved by less than the ftol tolerance over one rho stage",
+            ),
+            (
+                Status::MaxFunReached,
+                "the max_fun evaluation budget was exhausted",
+            ),
+            (
+                Status::ModelDegenerate,
+                "the interpolation model degenerated beyond rescue",
+            ),
+            (
+                Status::InvalidArgs,
+                "invalid arguments: bad bounds, npt, sizes, or config",
+            ),
+            (
+                Status::AllocationFailed,
+                "the solver workspace could not be allocated",
+            ),
+        ] {
+            let e: &dyn std::error::Error = &status;
+            assert_eq!(e.to_string(), text);
+        }
     }
 
     #[test]

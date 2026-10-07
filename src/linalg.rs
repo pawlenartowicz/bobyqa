@@ -40,14 +40,6 @@ pub(crate) fn matprod12_into(x: &[f64], y: &Mat, z: &mut [f64]) {
     }
 }
 
-/// Allocating form of [`matprod12_into`] — thin wrapper, kept for tests; hot paths use `_into`.
-#[cfg(test)]
-pub(crate) fn matprod12(x: &[f64], y: &Mat) -> Vec<f64> {
-    let mut z = vec![0.0; y.ncols()];
-    matprod12_into(x, y, &mut z);
-    z
-}
-
 /// PRIMA linalg.f90 L377 `matprod21`: matrix x times column-vector y; z accumulates x(:, j)*y(j)
 /// column by column (NOT row-by-row dot products — the loop order is part of the contract).
 /// Zeroes `z` (length `x.nrows()`) first, like the fresh allocation it replaces.
@@ -80,14 +72,6 @@ pub(crate) fn matprod21_into(x: &Mat, y: &[f64], z: &mut [f64]) {
     }
 }
 
-/// Allocating form of [`matprod21_into`] — thin wrapper, kept for tests; hot paths use `_into`.
-#[cfg(test)]
-pub(crate) fn matprod21(x: &Mat, y: &[f64]) -> Vec<f64> {
-    let mut z = vec![0.0; x.nrows()];
-    matprod21_into(x, y, &mut z);
-    z
-}
-
 /// PRIMA linalg.f90 L420 `matprod22`: z(:, j) accumulates x(:, i)*y(i, j) — j outer, i inner.
 /// Zeroes `z` (shape `x.nrows()` × `y.ncols()`) first, like the fresh allocation it replaces.
 pub(crate) fn matprod22_into(x: &Mat, y: &Mat, z: &mut Mat) {
@@ -107,14 +91,6 @@ pub(crate) fn matprod22_into(x: &Mat, y: &Mat, z: &mut Mat) {
     }
 }
 
-/// Allocating form of [`matprod22_into`] — thin wrapper, kept for tests; hot paths use `_into`.
-#[cfg(test)]
-pub(crate) fn matprod22(x: &Mat, y: &Mat) -> Mat {
-    let mut z = Mat::zeros(x.nrows(), y.ncols());
-    matprod22_into(x, y, &mut z);
-    z
-}
-
 /// PRIMA linalg.f90 L502 `outprod`: z = x*y^T, filled column by column (full overwrite).
 #[expect(clippy::needless_range_loop)] // explicit indexed loops mirror PRIMA (rust.md §5)
 pub(crate) fn outprod_into(x: &[f64], y: &[f64], z: &mut Mat) {
@@ -127,14 +103,6 @@ pub(crate) fn outprod_into(x: &[f64], y: &[f64], z: &mut Mat) {
             zi[r] = x[r] * yi;
         }
     }
-}
-
-/// Allocating form of [`outprod_into`] — thin wrapper, kept for tests; hot paths use `_into`.
-#[cfg(test)]
-pub(crate) fn outprod(x: &[f64], y: &[f64]) -> Mat {
-    let mut z = Mat::zeros(x.len(), y.len());
-    outprod_into(x, y, &mut z);
-    z
 }
 
 /// `radix^((MIN_EXP - 1).max(1 - MAX_EXP))` = `2^-1022`, exactly `f64::MIN_POSITIVE` — the
@@ -190,7 +158,7 @@ pub(crate) fn norm(x: &[f64]) -> f64 {
 }
 
 /// PRIMA linalg.f90 L1129 `diag`, k = 0 only: the main diagonal.
-#[allow(dead_code)] // §3.4 audited helper; call sites in initialize.rs use indexed loops per the call-site convention
+#[allow(dead_code)] // no caller: call sites in initialize.rs use indexed loops per the call-site convention
 pub(crate) fn diag(a: &Mat) -> Vec<f64> {
     let dlen = a.nrows().min(a.ncols());
     let mut d = vec![0.0; dlen];
@@ -201,7 +169,7 @@ pub(crate) fn diag(a: &Mat) -> Vec<f64> {
 }
 
 /// PRIMA linalg.f90 L1798 `issymmetric`, tol = `consts::SYMTOL` (debug checks).
-#[allow(dead_code)] // §3.4 audited debug helper; used in linalg tests and future debug_assert sites
+#[allow(dead_code)] // debug helper with no caller outside the linalg tests
 pub(crate) fn issymmetric(a: &Mat) -> bool {
     if a.nrows() != a.ncols() {
         return false;
@@ -230,7 +198,7 @@ pub(crate) fn issymmetric(a: &Mat) -> bool {
 }
 
 /// PRIMA linalg.f90 L2224 `trueloc` — returns **0-based** positions of `true`, ascending.
-#[allow(dead_code)] // §3.4 audited helper; call sites in geometry/rescue use inline indexed loops per the call-site convention
+#[allow(dead_code)] // no caller: call sites in geometry/rescue use inline indexed loops per the call-site convention
 pub(crate) fn trueloc(x: &[bool]) -> Vec<usize> {
     let mut loc = Vec::with_capacity(x.len());
     for (i, &v) in x.iter().enumerate() {
@@ -359,33 +327,6 @@ mod tests {
     #[test]
     fn inprod_is_the_dot_product_in_order() {
         assert_eq!(inprod(&[1.0, 2.0, 3.0], &[4.0, 5.0, 6.0]), 32.0);
-    }
-
-    #[test]
-    fn matprod21_multiplies_matrix_by_column() {
-        // [[1,3],[2,4]] * [5,6]^T = [23, 34]
-        let a = Mat::from_col_major(2, 2, vec![1.0, 2.0, 3.0, 4.0]);
-        assert_eq!(matprod21(&a, &[5.0, 6.0]), vec![23.0, 34.0]);
-    }
-
-    #[test]
-    fn matprod12_multiplies_row_by_matrix() {
-        let a = Mat::from_col_major(2, 2, vec![1.0, 2.0, 3.0, 4.0]);
-        assert_eq!(matprod12(&[5.0, 6.0], &a), vec![17.0, 39.0]);
-    }
-
-    #[test]
-    fn matprod22_multiplies_two_matrices() {
-        let a = Mat::from_col_major(2, 2, vec![1.0, 2.0, 3.0, 4.0]);
-        let b = Mat::from_col_major(2, 2, vec![5.0, 6.0, 7.0, 8.0]);
-        // a*b = [[23,31],[34,46]] column-major [23,34,31,46]
-        assert_eq!(matprod22(&a, &b).data(), &[23.0, 34.0, 31.0, 46.0]);
-    }
-
-    #[test]
-    fn outprod_builds_x_y_transposed() {
-        let m = outprod(&[1.0, 2.0], &[3.0, 4.0]);
-        assert_eq!(m.data(), &[3.0, 6.0, 4.0, 8.0]);
     }
 
     #[test]

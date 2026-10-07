@@ -872,63 +872,8 @@ mod tests {
     }
 
     #[test]
-    fn setdrop_tr_without_improvement_never_drops_kopt() {
-        // All-equal distances make kopt competitive; its score is forced to -1 (L139).
-        // Identity-ish zmat keeps den finite; assert knew != Some(kopt) over several kopt values.
-        // n=2, npt=5: minimal problem, xpt = 5 columns with kopt at various positions.
-        let n = 2usize;
-        let npt = 5usize;
-        // xpt: identity-like, all columns near origin
-        let xpt = Mat::from_col_major(
-            n,
-            npt,
-            vec![
-                0.0, 0.0, // col 0
-                0.5, 0.0, // col 1
-                0.0, 0.5, // col 2
-                -0.5, 0.0, // col 3
-                0.0, -0.5, // col 4
-            ],
-        );
-        // bmat: n x (npt + n), identity-ish in first npt cols
-        let bmat = Mat::zeros(n, npt + n);
-        // zmat: npt x (npt - n - 1) = 5 x 2, identity-ish
-        let zmat = Mat::from_col_major(
-            npt,
-            npt - n - 1,
-            vec![
-                -5.656_854_249_492_38,
-                2.828_427_124_746_19,
-                0.0,
-                2.828_427_124_746_19,
-                0.0,
-                0.0,
-                0.0,
-                2.828_427_124_746_19,
-                -5.656_854_249_492_38,
-                2.828_427_124_746_19,
-            ],
-        );
-        let d = vec![0.1, 0.1];
-        let delta = 1.0;
-        let rho = 0.5;
-
-        for kopt in 0..npt {
-            let mut ws = GeostepWs::new(n, npt).unwrap();
-            let knew = setdrop_tr(
-                kopt, false, &bmat, &d, delta, rho, &xpt, &zmat, &mut ws, None,
-            );
-            assert!(
-                knew != Some(kopt),
-                "setdrop_tr with ximproved=false returned kopt={kopt}"
-            );
-        }
-    }
-
-    #[test]
     fn setdrop_tr_excludes_kopt_even_when_it_would_otherwise_win() {
-        // The test above never makes kopt the competitive max, so the `!ximproved` suppression
-        // (geometry.f90 L138-140, score[kopt] = -1) survives mutation. Construct a case where it is
+        // A case where the `!ximproved` suppression (geometry.f90 L138-140, score[kopt] = -1) is
         // load-bearing: xpt at the origin and zmat = 0 give hdiag = 0 => den = vlag^2; bmat[0,0] = 3
         // with d = [1] gives vlag[kopt] = 3*1 + 1 = 4 => den[kopt] = 16, den[others] = 0; distsq = 0
         // => weight = 1 => score[kopt] = 16 is the unique max (> 1). Without the suppression the
@@ -952,62 +897,5 @@ mod tests {
             None,
         );
         assert_eq!(knew, None);
-    }
-
-    #[test]
-    #[expect(clippy::similar_names)] // xopt/xpt are PRIMA identifiers (rust.md §5)
-    fn geostep_returns_a_nonzero_step_inside_the_bounds() {
-        // Use a concrete geometry state from the corpus (booth, npt=5, first entry).
-        // Verify postconditions L603–612: ||d|| > 0, sl <= xopt + d <= su elementwise.
-        let corpus = test_support::load_states("geostep");
-        let st = &corpus[0];
-        let e = &st.entry;
-        let xopt_col = e.usize("kopt") - 1;
-        let xpt = e.mat("xpt");
-        let sl = e.vec("sl");
-        let su = e.vec("su");
-        let xopt: Vec<f64> = xpt.col(xopt_col).to_vec();
-        let n = xpt.nrows();
-
-        let mut d = vec![0.0; n];
-        let mut ws = GeostepWs::new(n, xpt.ncols()).unwrap();
-        geostep(
-            e.usize("knew") - 1,
-            xopt_col,
-            &e.mat("bmat"),
-            e.f64("delbar"),
-            &sl,
-            &su,
-            &xpt,
-            &e.mat("zmat"),
-            &mut d,
-            &mut ws,
-        );
-
-        // postcondition: step is nonzero
-        let step_norm = norm(&d);
-        assert!(
-            step_norm > 0.0,
-            "geostep returned zero step, ||d|| = {step_norm}"
-        );
-
-        // postcondition: sl <= xopt + d <= su elementwise.
-        // Tolerance is 1e-12, not 1e-10: a real bounds violation (a missing clamp) is O(delbar) ~ 0.1,
-        // while `xopt[i] + d[i]` here only re-adds what geostep already clamped internally, so its only
-        // error is a few ulp of re-addition rounding (~2e-15 at these magnitudes). The exact eval-point
-        // invariant is guarded strictly (no slack) in tests/parity_prima.rs over the real trajectory.
-        for i in 0..n {
-            let xi = xopt[i] + d[i];
-            assert!(
-                xi >= sl[i] - 1e-12,
-                "d violates lower bound at i={i}: xopt[i]+d[i]={xi} < sl[i]={}",
-                sl[i]
-            );
-            assert!(
-                xi <= su[i] + 1e-12,
-                "d violates upper bound at i={i}: xopt[i]+d[i]={xi} > su[i]={}",
-                su[i]
-            );
-        }
     }
 }

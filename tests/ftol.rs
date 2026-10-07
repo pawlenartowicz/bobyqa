@@ -132,23 +132,38 @@ fn small_ftol_rel_stops_early_close_to_the_default_answer() {
     }
 }
 
-/// Spec §2 precedence: `FtolReached` is converged-class — it stops the solve instead of
-/// spending a restart, so a restart schedule that would otherwise recycle at `rho_end`
-/// never fires once ftol triggers first.
+/// Precedence: `FtolReached` is converged-class — when ftol and a restart trigger would fire
+/// at the same `rho` reduction, the solve stops instead of spending a restart.
+///
+/// `stall_reductions = 1` with the default `improve_rel_tol = 1e-6` asks for a restart at the
+/// first reduction that improved f by less than `1e-6 * max(|f|, 1)`; `ftol_rel = 1e-6` stops
+/// at that same reduction. The first two runs show each trigger alone fires there.
 #[test]
 fn ftol_stop_does_not_spend_a_restart() {
     let mut rc = RestartConfig::new();
-    rc.cycle_budget_frac = 0.0; // rho_end-only schedule — would restart at the ladder's end
-    let mut config = Config::new(2);
-    config.restart = Some(rc);
-    config.ftol_rel = Some(1e-8);
-    let mut solver = Bobyqa::new(2, config).expect("valid config");
-    let mut x = [1.0, 2.0];
-    let o = solver.minimize(sphere, &mut x, &[-5.0, -5.0], &[5.0, 5.0]);
-    assert_eq!(o.status, Status::FtolReached);
+    rc.cycle_budget_frac = 0.0;
+    rc.stall_reductions = 1;
+    let run = |restart: Option<RestartConfig>, ftol_rel: Option<f64>| {
+        let mut config = Config::new(2);
+        config.restart = restart;
+        config.ftol_rel = ftol_rel;
+        let mut solver = Bobyqa::new(2, config).expect("valid config");
+        let mut x = [1.0, 2.0];
+        let o = solver.minimize(sphere, &mut x, &[-5.0, -5.0], &[5.0, 5.0]);
+        (o.status, o.n_eval, solver.last_cycle_boundaries().to_vec())
+    };
+
+    let (_, _, restart_cuts) = run(Some(rc), None);
+    let (ftol_status, ftol_n_eval, _) = run(None, Some(1e-6));
+    assert_eq!(ftol_status, Status::FtolReached);
     assert_eq!(
-        solver.last_restart_count(),
-        0,
-        "ftol must win over the restart schedule"
+        restart_cuts.first(),
+        Some(&ftol_n_eval),
+        "the stall trigger and ftol must fire at the same reduction for this test to mean anything"
     );
+
+    let (status, n_eval, cuts) = run(Some(rc), Some(1e-6));
+    assert_eq!(status, Status::FtolReached);
+    assert_eq!(n_eval, ftol_n_eval);
+    assert_eq!(cuts, [], "ftol must win over the restart schedule");
 }

@@ -754,6 +754,10 @@ pub(crate) fn bobyqb<F: FnMut(&[f64]) -> f64>(
     // (`publish`), read by the caller's objective wrapper. Write-only here, so `None`
     // (`Bobyqa::minimize`) and `Some` take the same path through the solve.
     radius: Option<&Cell<TrustRadius>>,
+    // `Config::prima_parity`. `true` only when parity is off AND `npt` is the maximum
+    // `(n + 1)(n + 2) / 2`: the trust-region RESCUE test then uses Powell's factor 0.5 (see
+    // the site below). `false` runs PRIMA's test literally.
+    full_model_rescue_half: bool,
 ) -> (f64, usize, i32) {
     let n = x.len();
 
@@ -1105,8 +1109,16 @@ pub(crate) fn bobyqb<F: FnMut(&[f64]) -> f64>(
                     vmax = sq;
                 }
             }
-            let to_rescue =
-                ximproved && !(vlag_abs_sum.is_finite() && den.iter().any(|&v| v > vmax));
+            // `Config::prima_parity` deviation (rationale in that field's docs): on a fully
+            // determined model the test uses Powell's original factor HALF (PRIMA's commented
+            // alternatives at L401-402), keeping the `ximproved` gate and the non-finite guard.
+            // The `else` arm is PRIMA's L397 verbatim.
+            let den_ok = if full_model_rescue_half {
+                den.iter().any(|&v| v > 0.5 * vmax)
+            } else {
+                den.iter().any(|&v| v > vmax)
+            };
+            let to_rescue = ximproved && !(vlag_abs_sum.is_finite() && den_ok);
             if to_rescue {
                 // PRIMA bobyqb.f90 L405-417: the RESCUE call (solver/iprint/xhist/fhist omitted).
                 if rescued {
@@ -1510,40 +1522,6 @@ pub(crate) fn bobyqb<F: FnMut(&[f64]) -> f64>(
 mod tests {
     use super::*;
     use crate::mat::Mat;
-
-    #[test]
-    fn bobyqb_converges_on_the_sphere_to_small_tr_radius() {
-        let mut sphere = |x: &[f64]| x.iter().map(|v| v * v).sum::<f64>();
-        let mut x = vec![1.0, 2.0];
-        let mut ws = SolverWs::new(2, 5).unwrap();
-        ws.bobyqb.xl.copy_from_slice(&[-5.0, -5.0]);
-        ws.bobyqb.xu.copy_from_slice(&[5.0, 5.0]);
-        let (f, nf, info) = bobyqb(
-            &mut sphere,
-            500,
-            5,
-            0.1,
-            0.7,
-            f64::NEG_INFINITY,
-            None,
-            0.5,
-            2.0,
-            0.5,
-            1e-6,
-            &mut x,
-            &mut ws,
-            None,
-            None,
-        );
-        assert_eq!(info, SMALL_TR_RADIUS);
-        // Same params/bounds/x0 as the frozen `sphere_n2_npt5` golden, which pins these bit-exact
-        // (n_eval 22, f ~1.2e-32, x ~[-1.1e-16, 0]). Pin the eval count and tighten f/x far below the
-        // golden's actual values — a spuriously-early convergence (wrong rho schedule) no longer slips
-        // through the old 5..=500 / 1e-8 / 1e-3 slack.
-        assert_eq!(nf, 22);
-        assert!(f < 1e-20, "f = {f:e}");
-        assert!(x.iter().all(|v| v.abs() < 1e-10));
-    }
 
     #[test]
     fn errbd_takes_the_interior_bound_and_crvmin_arms() {

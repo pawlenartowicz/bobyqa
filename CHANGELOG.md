@@ -5,6 +5,35 @@ All notable changes to this crate are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.2] — Unreleased
+
+**With a default `Config`, every one-dimensional problem (and any problem run at the maximum
+`npt = (n + 1)(n + 2) / 2`) can now depart from PRIMA's trajectory; set the new
+`Config::prima_parity = true` to get PRIMA's trajectories bit for bit, as before.** Every other
+`npt` is unchanged, bit for bit, in both modes.
+
+### Added
+
+- **`Config::prima_parity`** (default `false`). `true` reproduces PRIMA's BOBYQA bit for bit on
+  every `n` (the PRIMA golden battery runs in this mode, natively, with `libm` and on
+  `wasm32-wasip1`). `false` applies the crate's deliberate deviations from PRIMA, of which
+  there is one, below. Future deviations, if any, join this switch.
+
+### Changed
+
+- **No spurious RESCUE on a fully determined model.** At `npt = (n + 1)(n + 2) / 2` (the only
+  legal `npt` when `n = 1`) the quadratic model is fully determined, the updating formula's
+  `beta` is zero in exact arithmetic, and each denominator equals its `vlag` squared. PRIMA's
+  trust-region test for calling RESCUE (`bobyqb.f90` L397, `any(den > maxval(vlag**2))`) is
+  then decided by rounding alone: it fired on 16 of 26 improving steps of a one-dimensional
+  REML-shaped objective and on 21 of 50 of two-dimensional Rosenbrock at `npt = 6`, each time
+  spending objective evaluations on a healthy model. With `prima_parity: false` the test uses
+  Powell's original factor `0.5` (PRIMA's commented alternatives at L401-402), which still calls
+  RESCUE on non-finite values and on a denominator damaged well below `vlag**2`. On a 2,000-case
+  one-dimensional fuzz of quadratics with noise and random boxes the default took fewer
+  evaluations than parity mode in 1,251 cases, the same in 673 and more in 76, and never ended
+  above parity mode's final value beyond the solve's accuracy (`tests/one_dimensional.rs`).
+
 ## [0.3.1] — 2026-10-02
 
 Additive only: `Bobyqa::minimize` and `bobyqa(...)` are unchanged, bit for bit.

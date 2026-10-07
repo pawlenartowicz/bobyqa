@@ -37,7 +37,7 @@ impl Mat {
         })
     }
 
-    #[allow(dead_code)] // §3.4 audited constructor; used by test_support.rs parser and test modules (cfg(test) only)
+    #[allow(dead_code)] // used by the test_support.rs parser and test modules (cfg(test) only)
     pub(crate) fn from_col_major(nrows: usize, ncols: usize, data: Vec<f64>) -> Self {
         assert_eq!(data.len(), nrows * ncols, "shape/data mismatch");
         Self { data, nrows }

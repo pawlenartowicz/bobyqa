@@ -203,6 +203,10 @@ fn load_goldens() -> Vec<Golden> {
         .filter(|p| p.extension().is_some_and(|ext| ext == "txt"))
         .collect();
     paths.sort();
+    assert!(
+        !paths.is_empty(),
+        "tests/goldens/ has no .txt files — run oracle/capture.sh"
+    );
     paths
         .iter()
         .map(|p| {
@@ -282,67 +286,8 @@ fn nansphere(x: &[f64]) -> f64 {
 }
 
 // ---------------------------------------------------------------------------
-// Parser unit tests (embedded sample — no file I/O)
-// ---------------------------------------------------------------------------
-
-const SAMPLE: &str = "\
-# bobyqa golden v1
-# prima 0123456789abcdef0123456789abcdef01234567
-# compiler GNU Fortran (GCC) 15.2.1
-problem sphere
-n 2
-npt 5
-rho_begin 0.5
-rho_end 1e-06
-max_fun 500
-x0 1 2
-lower -5 -5
-upper 5 5
-eval 1 2 5
-eval 0.5 2 4.25
-final 0.5 2 4.25 2 0 PRIMA_SMALL_TR_RADIUS
-";
-
-#[test]
-fn embedded_sample_parses_field_for_field() {
-    let g = parse_golden(SAMPLE).expect("sample parses");
-    assert_eq!(g.problem, "sphere");
-    assert_eq!(g.n, 2);
-    assert_eq!(g.npt, 5);
-    assert_eq!(g.rho_begin, 0.5);
-    assert_eq!(g.rho_end, 1e-6);
-    assert_eq!(g.max_fun, 500);
-    assert_eq!(g.x0, [1.0, 2.0]);
-    assert_eq!(g.lower, [-5.0, -5.0]);
-    assert_eq!(g.upper, [5.0, 5.0]);
-    assert_eq!(g.evals.len(), 2);
-    assert_eq!(g.evals[0].x, [1.0, 2.0]);
-    assert_eq!(g.evals[0].f, 5.0);
-    assert_eq!(g.evals[1].f, 4.25);
-    assert_eq!(g.final_line.x, [0.5, 2.0]);
-    assert_eq!(g.final_line.f, 4.25);
-    assert_eq!(g.final_line.n_eval, 2);
-    assert_eq!(g.final_line.rc, 0);
-    assert_eq!(g.final_line.rc_name, "PRIMA_SMALL_TR_RADIUS");
-}
-
-#[test]
-fn text_without_the_version_line_is_rejected() {
-    assert!(parse_golden("problem sphere\n").is_err());
-}
-
-// ---------------------------------------------------------------------------
 // Integrity tests over the checked-in goldens (design §6: run in M0)
 // ---------------------------------------------------------------------------
-
-#[test]
-fn every_checked_in_golden_parses() {
-    let goldens = load_goldens();
-    assert!(
-        !goldens.is_empty(),
-        "tests/goldens/ has no .txt files — run oracle/capture.sh"
-    );
-}
 
 #[test]
 fn n_eval_matches_the_number_of_eval_lines() {
@@ -390,13 +335,15 @@ fn repeated_minimize_on_one_solver_is_bit_identical() {
     // The SPEC §4 reuse contract (M2 design §4.5): a solver's Nth `minimize` is independent of
     // calls 1..N-1. Running every golden twice on ONE instance and comparing the full
     // evaluation trajectories bitwise catches cross-call stale-workspace leakage that the
-    // fresh-solver golden test above cannot see.
+    // fresh-solver golden test below cannot see.
     for g in load_goldens() {
         let mut config = Config::new(g.n);
         config.npt = g.npt;
         config.rho_begin = g.rho_begin;
         config.rho_end = g.rho_end;
         config.max_fun = g.max_fun;
+        // The goldens are PRIMA captures, so they replay in PRIMA parity mode.
+        config.prima_parity = true;
         let mut solver = Bobyqa::new(g.n, config).expect("golden config is valid");
         let f = objective(&g.problem);
         let run = |solver: &mut Bobyqa| {
@@ -451,81 +398,115 @@ fn repeated_minimize_on_one_solver_is_bit_identical() {
     }
 }
 
+/// A replayed solve: (trajectory of evaluated points and values, final x, outcome).
+type Replay = (Vec<(Vec<f64>, f64)>, Vec<f64>, bobyqa::Outcome);
+
+/// Replays one golden with the given parity mode.
+fn replay(g: &Golden, prima_parity: bool) -> Replay {
+    // f_target stays Config::new's -INFINITY default — matches the driver's hardcoded value.
+    let mut config = Config::new(g.n);
+    config.npt = g.npt;
+    config.rho_begin = g.rho_begin;
+    config.rho_end = g.rho_end;
+    config.max_fun = g.max_fun;
+    config.prima_parity = prima_parity;
+    let mut solver = Bobyqa::new(g.n, config).expect("golden config is valid");
+    let f = objective(&g.problem);
+    let mut trajectory: Vec<(Vec<f64>, f64)> = Vec::new();
+    let mut x = g.x0.clone();
+    let outcome = solver.minimize(
+        |p: &[f64]| {
+            let fp = f(p);
+            trajectory.push((p.to_vec(), fp));
+            fp
+        },
+        &mut x,
+        &g.lower,
+        &g.upper,
+    );
+    (trajectory, x, outcome)
+}
+
 #[test]
 fn full_trajectory_matches_every_golden() {
     // The frozen goldens are the regression oracle: with PARITY_TOL = 0.0 this replays each PRIMA
     // capture and asserts the full evaluation trajectory bitwise, so any deviation is a
     // port-faithfulness or determinism regression, not a tolerance miss.
-    for g in load_goldens() {
-        // f_target stays Config::new's -INFINITY default — matches the driver's hardcoded value.
-        let mut config = Config::new(g.n);
-        config.npt = g.npt;
-        config.rho_begin = g.rho_begin;
-        config.rho_end = g.rho_end;
-        config.max_fun = g.max_fun;
-        let mut solver = Bobyqa::new(g.n, config).expect("golden config is valid");
-        let f = objective(&g.problem);
-        let mut trajectory: Vec<(Vec<f64>, f64)> = Vec::new();
-        let mut x = g.x0.clone();
-        let outcome = solver.minimize(
-            |p: &[f64]| {
-                let fp = f(p);
-                trajectory.push((p.to_vec(), fp));
-                fp
-            },
-            &mut x,
-            &g.lower,
-            &g.upper,
-        );
-        assert_eq!(
-            trajectory.len(),
-            g.evals.len(),
-            "{}: trajectory length",
-            g.problem
-        );
-        for (i, (want, got)) in g.evals.iter().zip(&trajectory).enumerate() {
-            for j in 0..g.n {
-                assert!(
-                    close(want.x[j], got.0[j], PARITY_TOL),
-                    "{}: eval {i}, x[{j}]",
-                    g.problem
-                );
-                // The crate's #1 hard constraint (CLAUDE.md / spec §3): every point at which the
-                // objective is evaluated lies in [lower, upper]. Asserted directly and strictly (no
-                // slack) on the real evaluated point — previously guarded only transitively (PRIMA
-                // stays feasible, the trajectory is bit-exact), which a Rust-side clamping bug that
-                // preserved the trajectory values could slip past.
-                assert!(
-                    got.0[j] >= g.lower[j] && got.0[j] <= g.upper[j],
-                    "{}: eval {i} x[{j}]={} outside [{}, {}]",
-                    g.problem,
-                    got.0[j],
-                    g.lower[j],
-                    g.upper[j]
-                );
+    //
+    // Parity mode must reproduce every golden. The default config deviates from PRIMA only on
+    // the fully determined model (npt = (n + 1)(n + 2) / 2, see `Config::prima_parity`), so it
+    // must reproduce every golden below that npt too.
+    for prima_parity in [true, false] {
+        for g in load_goldens() {
+            if !prima_parity && g.npt == (g.n + 1) * (g.n + 2) / 2 {
+                continue;
+            }
+            let name = format!("{} (prima_parity = {prima_parity})", g.problem);
+            let (trajectory, x, outcome) = replay(&g, prima_parity);
+            assert_eq!(trajectory.len(), g.evals.len(), "{name}: trajectory length");
+            for (i, (want, got)) in g.evals.iter().zip(&trajectory).enumerate() {
+                for j in 0..g.n {
+                    assert!(
+                        close(want.x[j], got.0[j], PARITY_TOL),
+                        "{name}: eval {i}, x[{j}]"
+                    );
+                    // The crate's #1 hard constraint (CLAUDE.md / spec §3): every point at which
+                    // the objective is evaluated lies in [lower, upper]. Asserted directly and
+                    // strictly (no slack) on the real evaluated point — previously guarded only
+                    // transitively (PRIMA stays feasible, the trajectory is bit-exact), which a
+                    // Rust-side clamping bug that preserved the trajectory values could slip past.
+                    assert!(
+                        got.0[j] >= g.lower[j] && got.0[j] <= g.upper[j],
+                        "{name}: eval {i} x[{j}]={} outside [{}, {}]",
+                        got.0[j],
+                        g.lower[j],
+                        g.upper[j]
+                    );
+                }
+                assert!(close(want.f, got.1, PARITY_TOL), "{name}: eval {i}, f");
+            }
+            for (j, (want_x, got_x)) in g.final_line.x.iter().zip(&x).enumerate() {
+                assert!(close(*want_x, *got_x, PARITY_TOL), "{name}: final x[{j}]");
             }
             assert!(
-                close(want.f, got.1, PARITY_TOL),
-                "{}: eval {i}, f",
-                g.problem
+                close(g.final_line.f, outcome.f, PARITY_TOL),
+                "{name}: final f"
             );
+            assert_eq!(outcome.n_eval, g.final_line.n_eval, "{name}: n_eval");
+            // All 14 goldens terminate on PRIMA_SMALL_TR_RADIUS (rc 0) -> Status::Converged. The
+            // trajectory/x/f/n_eval are pinned above, but outcome.status went unchecked, so a
+            // status_from_info regression mapping SMALL_TR_RADIUS to the wrong variant stayed
+            // green.
+            assert_eq!(outcome.status, Status::Converged, "{name}: status");
         }
-        for (j, (want_x, got_x)) in g.final_line.x.iter().zip(&x).enumerate() {
-            assert!(
-                close(*want_x, *got_x, PARITY_TOL),
-                "{}: final x[{j}]",
-                g.problem
-            );
-        }
-        assert!(
-            close(g.final_line.f, outcome.f, PARITY_TOL),
-            "{}: final f",
-            g.problem
-        );
-        assert_eq!(outcome.n_eval, g.final_line.n_eval, "{}: n_eval", g.problem);
-        // All 14 goldens terminate on PRIMA_SMALL_TR_RADIUS (rc 0) -> Status::Converged. The
-        // trajectory/x/f/n_eval are pinned above, but outcome.status went unchecked, so a
-        // status_from_info regression mapping SMALL_TR_RADIUS to the wrong variant stayed green.
-        assert_eq!(outcome.status, Status::Converged, "{}: status", g.problem);
     }
+}
+
+#[test]
+fn default_config_on_a_fully_determined_golden_converges_as_well_as_prima() {
+    // The fully determined goldens (npt = (n + 1)(n + 2) / 2) may take a different path by
+    // default. They must still converge, stay feasible, and end at least as low as PRIMA within
+    // the solve's own accuracy.
+    let mut checked = 0;
+    for g in load_goldens() {
+        if g.npt != (g.n + 1) * (g.n + 2) / 2 {
+            continue;
+        }
+        checked += 1;
+        let (t_def, _, o_def) = replay(&g, false);
+        assert_eq!(o_def.status, Status::Converged, "{}: status", g.problem);
+        assert!(
+            o_def.f <= g.final_line.f + 1e-12 * (1.0 + g.final_line.f.abs()),
+            "{}: default f {} vs PRIMA {}",
+            g.problem,
+            o_def.f,
+            g.final_line.f
+        );
+        for (p, _) in &t_def {
+            for ((v, lo), hi) in p.iter().zip(&g.lower).zip(&g.upper) {
+                assert!(v >= lo && v <= hi, "{}: infeasible", g.problem);
+            }
+        }
+    }
+    assert!(checked >= 1);
 }

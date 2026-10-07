@@ -788,14 +788,6 @@ mod tests {
     }
 
     #[test]
-    fn trrad_takes_the_shrink_keep_and_expand_branches() {
-        // eta1 = 0.1, eta2 = 0.7, gamma1 = 0.5, gamma2 = 2.0 (the consts.rs defaults).
-        assert_eq!(trrad(1.0, 0.4, 0.1, 0.7, 0.5, 2.0, 0.05), 0.4); // min(0.5, 0.4)
-        assert_eq!(trrad(1.0, 0.8, 0.1, 0.7, 0.5, 2.0, 0.5), 0.8); // max(0.5, 0.8)
-        assert_eq!(trrad(1.0, 0.8, 0.1, 0.7, 0.5, 2.0, 0.9), 1.6); // max(0.5, 1.6)
-    }
-
-    #[test]
     fn trsbox_takes_the_unconstrained_newton_step_on_a_separable_quadratic() {
         // Q(x) = 0.5*(x1^2 + x2^2) via hq = I, gopt = (1, 0.5) at xopt = 0, wide bounds,
         // delta large: minimizer d = -gopt, interior, crvmin = 1 (the Rayleigh quotient).

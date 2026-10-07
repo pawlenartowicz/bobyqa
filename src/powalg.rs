@@ -62,14 +62,6 @@ pub(crate) fn setij_into(n: usize, npt: usize, ij: &mut Vec<(usize, usize)>) {
     }
 }
 
-/// Allocating form of [`setij_into`] — thin wrapper, kept for tests; hot paths use `_into`.
-#[cfg(test)]
-pub(crate) fn setij(n: usize, npt: usize) -> Vec<(usize, usize)> {
-    let mut ij = Vec::new();
-    setij_into(n, npt, &mut ij);
-    ij
-}
-
 /// PRIMA powalg.f90 L790 `hess_mul`: HESSIAN*x with HESSIAN = HQ (0 if absent) +
 /// `sum_k PQ(k)*XPT(:, k)*XPT(:, k)^T`. `hq` **is** omitted at three BOBYQA call sites
 /// (update.f90 L360/L464, geometry.f90 L309) → `Option`, `None` ≡ Fortran "0 if absent".
@@ -105,15 +97,6 @@ pub(crate) fn hess_mul_into(
             }
         }
     }
-}
-
-/// Allocating form of [`hess_mul_into`] — thin wrapper, kept for tests; hot paths use `_into`.
-#[cfg(test)]
-pub(crate) fn hess_mul(x: &[f64], xpt: &Mat, pq: &[f64], hq: Option<&Mat>) -> Vec<f64> {
-    let mut dxpt = vec![0.0; xpt.ncols()];
-    let mut y = vec![0.0; xpt.nrows()];
-    hess_mul_into(x, xpt, pq, hq, &mut dxpt, &mut y);
-    y
 }
 
 /// PRIMA powalg.f90 L551 `quadinc_d0` (the only variant BOBYQA calls; always with `hq`):
@@ -432,34 +415,6 @@ pub(crate) fn calvlag_and_den_into(
 mod tests {
     use super::*;
     use crate::mat::Mat;
-
-    #[test]
-    fn setij_yields_valid_distinct_pairs_of_the_right_count() {
-        for (n, npt) in [(2, 6), (3, 10), (10, 30)] {
-            let ij = setij(n, npt);
-            assert_eq!(ij.len(), npt - 2 * n - 1);
-            for &(i, j) in &ij {
-                assert!(i < n && j < n && i != j, "bad pair ({i}, {j}) for n={n}");
-            }
-        }
-    }
-
-    #[test]
-    fn setij_is_empty_at_powells_default_npt() {
-        assert_eq!(setij(2, 5), [] as [(usize, usize); 0]);
-    }
-
-    #[test]
-    fn hess_mul_combines_explicit_and_implicit_parts() {
-        // n=1, npt=3: H = hq + sum pq_k * xpt_k xpt_k^T = 2 + (1*1 + 2*4) = 11; H*x at x=3 -> 33.
-        let xpt = Mat::from_col_major(1, 3, vec![1.0, 2.0, 0.0]);
-        let hq = Mat::from_col_major(1, 1, vec![2.0]);
-        assert_eq!(
-            hess_mul(&[3.0], &xpt, &[1.0, 2.0, 0.0], Some(&hq)),
-            vec![33.0]
-        );
-        assert_eq!(hess_mul(&[3.0], &xpt, &[1.0, 2.0, 0.0], None), vec![27.0]);
-    }
 
     #[test]
     fn quadinc_evaluates_the_model_increment() {

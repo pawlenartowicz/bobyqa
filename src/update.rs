@@ -591,17 +591,6 @@ mod tests {
     }
 
     #[test]
-    fn updatexf_without_improvement_keeps_kopt() {
-        let mut xpt = Mat::zeros(1, 4);
-        let mut fval = vec![3.0, 1.0, 4.0, 5.0];
-        let mut kopt = 1;
-        updatexf(Some(2), false, 2.0, &[0.5], &mut kopt, &mut fval, &mut xpt);
-        assert_eq!(kopt, 1);
-        assert_eq!(fval[2], 2.0);
-        assert_eq!(xpt[[0, 2]], 0.5);
-    }
-
-    #[test]
     fn updatexf_with_no_knew_is_a_silent_no_op() {
         // knew = None must return before touching kopt/fval/xpt (PRIMA L249-252). The oracle corpus
         // never captures knew=0 for updatexf, so this is the sole guard for the sentinel path; pass

@@ -12,7 +12,7 @@ pub(crate) const FUNCMAX: f64 = 1.0e30;
 /// PRIMA consts.F90 L172: any |bound| >= BOUNDMAX means "no bound".
 pub(crate) const BOUNDMAX: f64 = 0.25 * REALMAX;
 /// PRIMA consts.F90 L210 (released, f64): symmetry-test tolerance max(10*EPS, 1e-10).
-#[allow(dead_code)] // used by linalg::issymmetric, a §3.4 audited debug helper
+#[allow(dead_code)] // used only by linalg::issymmetric, a debug helper with no caller outside tests
 pub(crate) const SYMTOL: f64 = 1.0e-10;
 
 // Defaults (consts.F90 L229-254). FTARGET diverges deliberately: PRIMA's -REALMAX would make

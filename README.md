@@ -55,7 +55,7 @@ println!("f = {:.2e} at {:?} after {} evaluations", outcome.f, x, outcome.n_eval
 | | `bobyqa` (this crate) | [basin](https://crates.io/crates/basin) | [nlopt](https://crates.io/crates/nlopt) (`LN_BOBYQA`) |
 |---|---|---|---|
 | Implementation | pure Rust, this one algorithm | pure Rust, multi-solver framework | C library, statically linked |
-| Algorithm source | PRIMA (2026), bit-exact against its golden trajectories | ported from PRIMA v0.7.2; final-point parity to tolerance, trajectories diverge | C translation of Powell's 2009 Fortran |
+| Algorithm source | PRIMA (2026), bit-exact against its golden trajectories (`Config::prima_parity`) | ported from PRIMA v0.7.2; final-point parity to tolerance, trajectories diverge | C translation of Powell's 2009 Fortran |
 | Required dependencies | none (`libm` opt-in) | `rand` family, `num-traits`, `web-time` | C toolchain; bundles libnlopt |
 | WebAssembly | yes | yes | no |
 | `no_std` | yes (`alloc` + `libm`) | no | no |
@@ -63,7 +63,7 @@ println!("f = {:.2e} at {:?} after {} evaluations", outcome.f, x, outcome.n_eval
 
 Speed: on a clock-locked machine over the standard test functions, this crate is
 **4.4–9.9× faster than PRIMA**with identical trajectories and evaluation
-counts, a reused `Bobyqa` against `prima_minimize`, which allocates and packs its
+counts (measured in PRIMA parity mode), a reused `Bobyqa` against `prima_minimize`, which allocates and packs its
 workspace on every call. nlopt's C core is faster on cheap objectives, and the gap narrows
 as the objective grows more expensive.
 
@@ -155,8 +155,8 @@ restart here, and the guarantees around it, are this crate's own — see
 
 | Design | Detail |
 |---|---|
-| Faithful port | behaviour-for-behaviour port of PRIMA's modern-Fortran BOBYQA — the same trust-region method, Lagrange-model maintenance, geometry-restoring rescue, and box handling that earn BOBYQA its robustness. [Restarts](#restarts) are the one addition, off by default, and leave the port untouched when unused |
-| Bit-exact parity | reproduces PRIMA bit-for-bit across the golden `(x, f)` trajectory battery — every evaluation in order, the rescue path included — natively and on `wasm32-wasip1` |
+| Faithful port | behaviour-for-behaviour port of PRIMA's modern-Fortran BOBYQA — the same trust-region method, Lagrange-model maintenance, geometry-restoring rescue, and box handling that earn BOBYQA its robustness. [Restarts](#restarts) are the one addition, off by default, and leave the port untouched when unused. One deliberate deviation, behind `Config::prima_parity`: no spurious rescue on a fully determined model (below) |
+| Bit-exact parity | with `Config::prima_parity = true`, reproduces PRIMA bit-for-bit across the golden `(x, f)` trajectory battery — every evaluation in order, the rescue path included — natively and on `wasm32-wasip1`. The default differs only at the maximum `npt = (n + 1)(n + 2) / 2`, so on every one-dimensional problem: there PRIMA's rescue test is decided by rounding alone, and the default uses Powell's original threshold instead |
 | Pure Rust | no C, Fortran, or system libraries; builds anywhere `cargo` does, including `wasm32-unknown-unknown` |
 | Zero dependencies | zero by default; the optional `libm` feature (the `no_std` math backend) is the only dependency, and only when you ask for it |
 | `no_std` + `alloc` | `default-features = false, features = ["libm"]` builds without `std` — see [`no_std` usage](#no_std-usage) |

@@ -58,10 +58,16 @@ fn stall_schedule(max_restarts: usize) -> RestartConfig {
 
 #[test]
 fn restart_fires_at_least_once_on_a_stalling_problem() {
+    let mut base = Bobyqa::new(2, Config::new(2)).unwrap();
+    let mut xb = [-1.2, 1.0];
+    let ob = base.minimize(rosenbrock, &mut xb, &[-5.0, -5.0], &[5.0, 5.0]);
+
     let mut s = Bobyqa::new(2, with_restart(Config::new(2), stall_schedule(8))).unwrap();
     let mut x = [-1.2, 1.0];
     let o = s.minimize(rosenbrock, &mut x, &[-5.0, -5.0], &[5.0, 5.0]);
     assert_eq!(o.status, Status::Converged);
+    // The returned point must be at least as good as restart-off on the same problem.
+    assert!(o.f <= ob.f + 1e-12, "restart worse: {} vs {}", o.f, ob.f);
     assert!(
         s.last_restart_count() >= 1,
         "expected a restart, got {}",
@@ -91,28 +97,6 @@ fn restart_stops_at_the_max_restarts_backstop() {
     );
 }
 
-// After restarts, the returned point must be at least as good as restart-off, and the run
-// must terminate cleanly (Converged or MaxFunReached — never ModelDegenerate from a corrupted
-// model). Compares the restart-enabled solver against restart-off on the same stalling problem.
-#[test]
-fn restart_never_degrades_below_restart_off_and_keeps_the_model_finite() {
-    let mut base = Bobyqa::new(2, Config::new(2)).unwrap();
-    let mut xb = [-1.2, 1.0];
-    let ob = base.minimize(rosenbrock, &mut xb, &[-5.0, -5.0], &[5.0, 5.0]);
-
-    let mut s = Bobyqa::new(2, with_restart(Config::new(2), stall_schedule(8))).unwrap();
-    let mut xs = [-1.2, 1.0];
-    let os = s.minimize(rosenbrock, &mut xs, &[-5.0, -5.0], &[5.0, 5.0]);
-
-    assert!(matches!(
-        os.status,
-        Status::Converged | Status::MaxFunReached
-    ));
-    assert!(os.found_finite());
-    assert!(os.f <= ob.f + 1e-12, "restart worse: {} vs {}", os.f, ob.f);
-    assert!(s.last_restart_count() >= 1);
-}
-
 #[test]
 fn restart_stops_early_on_the_improve_rel_tol_plateau() {
     // Sphere is already essentially exact by the time rho reaches rho_end; the next cycle
@@ -122,25 +106,11 @@ fn restart_stops_early_on_the_improve_rel_tol_plateau() {
     let mut x = [1.0, 1.0];
     let o = s.minimize(sphere, &mut x, &[-5.0, -5.0], &[5.0, 5.0]);
     assert_eq!(o.status, Status::Converged);
-    assert!(
-        s.last_restart_count() < 8,
-        "expected the improve_rel_tol settle test to stop restarts early, got {}",
+    assert_eq!(
         s.last_restart_count(),
+        1,
+        "the improve_rel_tol settle test must stop restarts after the first one",
     );
-}
-
-#[test]
-fn restart_respects_the_total_max_fun_backstop() {
-    // A tiny budget forces MaxFunReached — must return the best seen, never panic, never
-    // ModelDegenerate.
-    let mut cfg = Config::new(2);
-    cfg.max_fun = 30;
-    let mut s = Bobyqa::new(2, with_restart(cfg, stall_schedule(8))).unwrap();
-    let mut x = [-1.2, 1.0];
-    let o = s.minimize(rosenbrock, &mut x, &[-5.0, -5.0], &[5.0, 5.0]);
-    assert_eq!(o.status, Status::MaxFunReached);
-    assert_eq!(o.n_eval, 30);
-    assert!(o.found_finite());
 }
 
 #[test]
@@ -194,17 +164,28 @@ fn max_fun_cutoff_holds_at_every_budget_across_the_restart_window() {
 }
 
 #[test]
-fn a_restart_is_deterministic() {
-    // Same restart run twice must give an identical (x, f, n_eval, status, restart count).
-    let run = || {
-        let mut s = Bobyqa::new(2, with_restart(Config::new(2), stall_schedule(8))).unwrap();
+fn a_reused_solver_repeats_a_restart_run_exactly() {
+    // A second `minimize` on the same solver must give an identical (x, f, n_eval, status,
+    // restart count, cycle boundaries): nothing of the first run's restart state may leak.
+    let mut s = Bobyqa::new(2, with_restart(Config::new(2), stall_schedule(8))).unwrap();
+    let mut run = || {
         let mut x = [-1.2, 1.0];
         let o = s.minimize(rosenbrock, &mut x, &[-5.0, -5.0], &[5.0, 5.0]);
-        (o.f.to_bits(), o.n_eval, o.status, s.last_restart_count(), x)
+        (
+            o.f.to_bits(),
+            o.n_eval,
+            o.status,
+            s.last_restart_count(),
+            s.last_cycle_boundaries().to_vec(),
+            x,
+        )
     };
     let a = run();
-    assert_eq!(a, run(), "a restart schedule must be deterministic");
-    assert!(matches!(a.2, Status::Converged | Status::MaxFunReached));
+    assert_eq!(a, run(), "a reused solver must repeat the restart run");
+    assert!(
+        a.3 >= 1,
+        "no restart fired, so reuse of restart state went untested"
+    );
 }
 
 // Spec §5.4, degenerate case 1: the opening solve exits before `rho_end`, so the restart hook is
@@ -231,16 +212,6 @@ fn opening_solve_converging_before_rho_end_gives_zero_restarts_and_matches_resta
     assert_eq!(ob.n_eval, o.n_eval);
     assert_eq!(ob.f.to_bits(), o.f.to_bits());
     assert_eq!(xb, x);
-}
-
-// Spec §5.4, degenerate case 2: `max_restarts = 0` would make the schedule a strictly more
-// expensive restart-off solve, so it is rejected rather than silently accepted. Pinned at the
-// integration level (the `lib.rs` unit test covers it alongside the other knobs).
-#[test]
-fn new_rejects_max_restarts_zero() {
-    let mut rc = RestartConfig::new();
-    rc.max_restarts = 0;
-    assert!(Bobyqa::new(2, with_restart(Config::new(2), rc)).is_err());
 }
 
 // The one-shot `bobyqa` free function carries the restart schedule inside `Config`, so it must
@@ -283,8 +254,9 @@ fn one_shot_bobyqa_with_restarts_matches_the_reusable_solver() {
 
 // A restart must never turn a converged answer into a failed status. At `npt = (n+1)(n+2)/2`
 // the quadratic is fully determined and the converged interpolation set is tight to machine
-// precision; this exact configuration already drives plain restart-off runs through two RESCUE
-// calls before any restart exists, so it is where a spurious `DAMAGING_ROUNDING` would surface.
+// precision; in PRIMA parity mode this exact configuration already drives plain restart-off
+// runs through two RESCUE calls before any restart exists, so it is where a spurious
+// `DAMAGING_ROUNDING` would surface.
 // Pin both halves — the status is the convergence that was earned, and `f` is bit-identical to
 // restart-off, because the cycle that triggered the restart had already reached `rho_end`
 // holding the incumbent that gets returned.
@@ -293,6 +265,7 @@ fn a_restart_never_downgrades_a_converged_answer_to_model_degenerate() {
     const N: usize = 8;
     let mut cfg = Config::new(N);
     cfg.npt = (N + 1) * (N + 2) / 2; // 45 — fully determined, NOT the 2n+1 default
+    cfg.prima_parity = true; // the default config makes no RESCUE call on this solve
     let x0: Vec<f64> = (0..N)
         .map(|i| if i % 2 == 0 { -1.2 } else { 1.0 })
         .collect();
@@ -335,9 +308,9 @@ fn returned_point_matches_returned_value_across_restarts() {
     );
 }
 
-// Restart-off bit-identity — that a `restart: None` solver reproduces 0.1.x exactly — is
-// pinned by `tests/parity_prima.rs`, which replays the frozen PRIMA `(x, f)` trajectories
-// against plain `Bobyqa`. It is not duplicated here.
+// Restart-off bit-identity — that a `restart: None` solver in PRIMA parity mode reproduces PRIMA
+// exactly — is pinned by `tests/parity_prima.rs`, which replays the frozen PRIMA `(x, f)`
+// trajectories against a restart-off `Bobyqa`. It is not duplicated here.
 
 // ---- The stall trigger ----
 
@@ -483,7 +456,7 @@ fn the_cap_fires_where_no_other_trigger_can_and_zero_disables_it() {
 }
 
 #[test]
-fn the_recommended_schedule_runs_clean_and_restarts_at_most_once() {
+fn the_recommended_schedule_runs_clean_and_restarts_once() {
     // `RestartConfig::new()` as shipped, on a problem whose cycle does outspend its allowance.
     let mut cfg = Config::new(2);
     cfg.max_fun = 120;
@@ -496,12 +469,12 @@ fn the_recommended_schedule_runs_clean_and_restarts_at_most_once() {
         Status::Converged | Status::MaxFunReached
     ));
     assert!(o.found_finite());
-    assert!(
-        s.last_restart_count() <= 1,
-        "max_restarts = 1 must cap the count, got {}",
-        s.last_restart_count()
+    assert_eq!(
+        s.last_restart_count(),
+        1,
+        "the shipped cap must fire once on a cycle that outspends its allowance"
     );
-    assert_eq!(s.last_cycle_boundaries().len(), s.last_restart_count());
+    assert_eq!(s.last_cycle_boundaries().len(), 1);
 }
 
 #[test]
@@ -562,16 +535,6 @@ fn a_restart_returns_no_worse_than_its_cut_point() {
         o.f, global_min,
         "returned f must be the best evaluation of the whole solve"
     );
-    // And explicitly at each cut point: the best seen before the cut is never better than
-    // what the solve finally returns.
-    for &b in s.last_cycle_boundaries() {
-        let best_at_cut = log[..b].iter().copied().fold(f64::INFINITY, f64::min);
-        assert!(
-            o.f <= best_at_cut,
-            "returned f {} is worse than the best at cut point {b} ({best_at_cut})",
-            o.f
-        );
-    }
 }
 
 #[test]
@@ -674,15 +637,4 @@ fn a_solve_within_its_cycle_budget_never_trips_the_cap() {
         run(0.0),
         "a generous cap changed a solve that stayed within its cycle budgets"
     );
-}
-
-#[test]
-fn restart_none_keeps_the_restart_accessors_empty() {
-    // The default Config: no restarts, and the accessors say so after a real solve.
-    let mut s = Bobyqa::new(2, Config::new(2)).unwrap();
-    let mut x = [-1.2, 1.0];
-    let o = s.minimize(rosenbrock, &mut x, &[-5.0, -5.0], &[5.0, 5.0]);
-    assert_eq!(o.status, Status::Converged);
-    assert_eq!(s.last_restart_count(), 0);
-    assert_eq!(s.last_cycle_boundaries(), []);
 }

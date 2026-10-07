@@ -65,11 +65,11 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "libm")]
     fn the_backends_agree_bit_for_bit() {
-        // Tests always build with std, so whichever backend the seam compiled in can be pinned
-        // against the std intrinsics directly. Under `--features libm` this compares libm to
-        // std; under default features it is a tautology — the libm parity battery (§7.2) is the
-        // real gate, this is the fast local tripwire.
+        // Tests always build with std, so the libm seam can be pinned against the std intrinsics
+        // directly. The libm parity battery is the real gate, this is the fast local
+        // tripwire.
         let samples = [
             0.0,
             1.0,

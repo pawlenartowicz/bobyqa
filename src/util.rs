@@ -8,8 +8,6 @@ use crate::consts::{
 use crate::math;
 #[cfg(test)]
 use alloc::vec;
-#[cfg(test)]
-use alloc::vec::Vec;
 
 /// Fallible `vec![value; len]`: reserves via `try_reserve_exact` so an out-of-memory
 /// (or byte-capacity-overflow) request surfaces as an `Err` instead of aborting the
@@ -48,14 +46,6 @@ pub(crate) fn moderatex_into(x: &[f64], y: &mut [f64]) {
     for (yi, &xi) in y.iter_mut().zip(x) {
         *yi = moderatex1(xi);
     }
-}
-
-/// Allocating form of [`moderatex_into`] — thin wrapper, kept for tests; hot paths use `_into`.
-#[cfg(test)]
-pub(crate) fn moderatex(x: &[f64]) -> Vec<f64> {
-    let mut y = vec![0.0; x.len()];
-    moderatex_into(x, &mut y);
-    y
 }
 
 /// PRIMA evaluate.f90 L47 `moderatef`: NaN -> FUNCMAX, then clamp to [-REALMAX, FUNCMAX].
@@ -126,21 +116,6 @@ pub(crate) fn xinbd_into(
             x[i] = xu[i];
         }
     }
-}
-
-/// Allocating form of [`xinbd_into`] — thin wrapper, kept for tests; hot paths use `_into`.
-#[cfg(test)]
-pub(crate) fn xinbd(
-    xbase: &[f64],
-    step: &[f64],
-    xl: &[f64],
-    xu: &[f64],
-    sl: &[f64],
-    su: &[f64],
-) -> Vec<f64> {
-    let mut x = vec![0.0; xbase.len()];
-    xinbd_into(xbase, step, xl, xu, sl, su, &mut x);
-    x
 }
 
 /// PRIMA linalg.f90 `linspace_r` — `interval_max`'s internal grid builder.
@@ -252,10 +227,9 @@ mod tests {
 
     #[test]
     fn moderatex_replaces_nan_and_clamps_to_realmax() {
-        assert_eq!(
-            moderatex(&[f64::NAN, f64::INFINITY, 2.0]),
-            vec![0.0, f64::MAX, 2.0]
-        );
+        let mut y = [1.0; 3];
+        moderatex_into(&[f64::NAN, f64::INFINITY, 2.0], &mut y);
+        assert_eq!(y, [0.0, f64::MAX, 2.0]);
     }
 
     #[test]
@@ -269,6 +243,14 @@ mod tests {
         let mut sum = |x: &[f64]| x.iter().sum::<f64>();
         assert_eq!(evaluate(&mut sum, &[1.0, 2.0], &mut xmod), 3.0);
         assert!(evaluate(&mut sum, &[f64::NAN], &mut xmod[..1]).is_nan());
+        // Infinite inputs reach the objective clamped to ±REALMAX.
+        let mut seen = [0.0; 2];
+        let mut capture = |x: &[f64]| {
+            seen.copy_from_slice(x);
+            0.0
+        };
+        evaluate(&mut capture, &[f64::INFINITY, f64::NEG_INFINITY], &mut xmod);
+        assert_eq!(seen, [f64::MAX, -f64::MAX]);
     }
 
     #[test]
@@ -297,18 +279,38 @@ mod tests {
         let (xl, xu) = ([0.0, 0.0], [1.0, 1.0]);
         let (sl, su) = ([-0.5, -0.5], [0.5, 0.5]);
         // step beyond su -> x lands exactly on xu (no rounding residue)
-        let x = xinbd(&xbase, &[0.7, 0.0], &xl, &xu, &sl, &su);
-        assert_eq!(x, vec![1.0, 0.5]);
-        let x = xinbd(&xbase, &[-0.6, 0.2], &xl, &xu, &sl, &su);
-        assert_eq!(x, vec![0.0, 0.7]);
+        let mut x = [f64::NAN; 2];
+        xinbd_into(&xbase, &[0.7, 0.0], &xl, &xu, &sl, &su, &mut x);
+        assert_eq!(x, [1.0, 0.5]);
+        xinbd_into(&xbase, &[-0.6, 0.2], &xl, &xu, &sl, &su, &mut x);
+        assert_eq!(x, [0.0, 0.7]);
+        // xbase + su rounds below xu (0.7 + 0.1 is 0.7999999999999999 in f64), so only the
+        // explicit `s >= su` snap puts x on the bound.
+        let mut x1 = [f64::NAN];
+        xinbd_into(&[0.7], &[0.5], &[0.0], &[0.8], &[-0.7], &[0.1], &mut x1);
+        assert_eq!(x1, [0.8]);
     }
 
     #[test]
     fn interval_max_finds_the_grid_maximum() {
-        // f(x) = x*(1-x) on [0, 1]: max at 0.5; grid_size 50 must land on it or beside it.
+        // f(x) = x*(1-x) on [0, 1]: max at 0.5, between two grid points. The interpolation step
+        // is exact on a quadratic, so the result is 0.5 to rounding, not merely the nearest
+        // grid point (0.0102 away).
         let f = |x: f64, _: &[f64]| x * (1.0 - x);
         let (mut xgrid, mut fgrid) = (vec![0.0; 50], vec![0.0; 50]);
         let x = interval_max(f, 0.0, 1.0, &[], 50, &mut xgrid, &mut fgrid);
-        assert!((x - 0.5).abs() <= 0.5 / 50.0 + 1e-12);
+        assert!((x - 0.5).abs() <= 1e-12);
+    }
+
+    #[test]
+    fn interval_max_returns_an_endpoint_on_its_degenerate_branches() {
+        let (mut xgrid, mut fgrid) = (vec![0.0; 50], vec![0.0; 50]);
+        let mut run = |f: fn(f64, &[f64]) -> f64, lb: f64, ub: f64| {
+            interval_max(f, lb, ub, &[], 50, &mut xgrid, &mut fgrid)
+        };
+        assert_eq!(run(|x, _| x, 2.0, 1.0), 2.0); // ub <= lb -> lb
+        assert_eq!(run(|_, _| f64::NAN, 0.25, 1.0), 0.25); // all-NaN grid -> lb
+        assert_eq!(run(|x, _| -x, 0.25, 1.0), 0.25); // maximum at the first grid point -> lb
+        assert_eq!(run(|x, _| x, 0.0, 1.0), 1.0); // maximum at the last grid point -> ub
     }
 }

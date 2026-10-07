@@ -172,4 +172,48 @@ fn minimize_allocates_zero_after_construction_on_warm_and_rescue_paths() {
              across the restart hook, point relocation, and the boundary store)"
         );
     }
+
+    assert_one_dimensional_paths_allocate_zero();
+}
+
+/// The 1-D leg of the single zero-alloc test (split out for length; it must run inside that
+/// `#[test]`, see the module docs).
+fn assert_one_dimensional_paths_allocate_zero() {
+    // One-dimensional path in both `Config::prima_parity` modes. n = 1 is always the
+    // fully determined model, where parity mode takes PRIMA's RESCUE path on ordinary steps and
+    // the default takes Powell's factor instead; both must stay allocation-free.
+    for prima_parity in [false, true] {
+        let mut config = Config::new(1);
+        config.rho_begin = 0.5;
+        config.rho_end = 1e-8;
+        config.prima_parity = prima_parity;
+        let mut solver = Bobyqa::new(1, config).expect("valid config");
+        let before = alloc_count();
+        for call in 0..3 {
+            let mut x = [3.0];
+            let o = solver.minimize(
+                |p: &[f64]| 4.0 * (p[0] - 0.7) * (p[0] - 0.7) + 1.0,
+                &mut x,
+                &[-10.0],
+                &[10.0],
+            );
+            assert_eq!(
+                o.status,
+                Status::Converged,
+                "1-D ({prima_parity}) call {call}"
+            );
+            // Ties each mode to its own path, as the booth leg's n_eval does: on this problem
+            // parity mode's RESCUE calls cost three more evaluations.
+            assert_eq!(
+                o.n_eval,
+                if prima_parity { 17 } else { 14 },
+                "1-D ({prima_parity}) call {call} left its expected path"
+            );
+            assert_eq!(
+                alloc_count(),
+                before,
+                "1-D minimize (prima_parity = {prima_parity}) allocated on call {call}"
+            );
+        }
+    }
 }
