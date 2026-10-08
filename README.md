@@ -34,20 +34,23 @@ Build the solver once per problem size, then call it repeatedly with **no heap a
 call** — `Bobyqa::new` owns every allocation.
 
 ```rust
-use bobyqa::{Bobyqa, Config};
+use bobyqa::{Bobyqa, Config, Status};
 
-// Minimize the 2-D Rosenbrock function inside the box [-2, 2]².
-let mut solver = Bobyqa::new(2, Config::new(2))?;
+fn main() -> Result<(), Status> {
+    // Minimize the 2-D Rosenbrock function inside the box [-2, 2]².
+    let mut solver = Bobyqa::new(2, Config::new(2))?;
 
-let mut x = [0.0, 0.0]; // starting point — overwritten with the best point found
-let outcome = solver.minimize(
-    |x| (1.0 - x[0]).powi(2) + 100.0 * (x[1] - x[0] * x[0]).powi(2),
-    &mut x,
-    &[-2.0, -2.0], // lower bounds
-    &[ 2.0,  2.0], // upper bounds
-);
+    let mut x = [0.0, 0.0]; // starting point — overwritten with the best point found
+    let outcome = solver.minimize(
+        |x| (1.0 - x[0]).powi(2) + 100.0 * (x[1] - x[0] * x[0]).powi(2),
+        &mut x,
+        &[-2.0, -2.0], // lower bounds
+        &[ 2.0,  2.0], // upper bounds
+    );
 
-println!("f = {:.2e} at {:?} after {} evaluations", outcome.f, x, outcome.n_eval);
+    println!("f = {:.2e} at {:?} after {} evaluations", outcome.f, x, outcome.n_eval);
+    Ok(())
+}
 ```
 
 ## How it compares
@@ -62,7 +65,7 @@ println!("f = {:.2e} at {:?} after {} evaluations", outcome.f, x, outcome.n_eval
 | License | MIT OR Apache-2.0 | MIT OR Apache-2.0 | LGPL as a combined work; the BOBYQA files themselves MIT |
 
 Speed: on a clock-locked machine over the standard test functions, this crate is
-**4.4–9.9× faster than PRIMA**with identical trajectories and evaluation
+**4.4–9.9× faster than PRIMA** with identical trajectories and evaluation
 counts (measured in PRIMA parity mode), a reused `Bobyqa` against `prima_minimize`, which allocates and packs its
 workspace on every call. nlopt's C core is faster on cheap objectives, and the gap narrows
 as the objective grows more expensive.
@@ -90,27 +93,30 @@ the previous one converged in. The returned point is the best over every cycle, 
 restart never returns something worse than stopping would have.
 
 ```rust
-use bobyqa::{Bobyqa, Config, RestartConfig};
+use bobyqa::{Bobyqa, Config, RestartConfig, Status};
 
-// Same problem as above, but with restarts enabled — RestartConfig::new() is the
-// recommended schedule: one restart, fired when a cycle has spent an eighth of the
-// budget that remained when it started.
-let mut config = Config::new(2);
-config.restart = Some(RestartConfig::new());
-let mut solver = Bobyqa::new(2, config)?;
+fn main() -> Result<(), Status> {
+    // Same problem as above, but with restarts enabled — RestartConfig::new() is the
+    // recommended schedule: one restart, fired when a cycle has spent an eighth of the
+    // budget that remained when it started.
+    let mut config = Config::new(2);
+    config.restart = Some(RestartConfig::new());
+    let mut solver = Bobyqa::new(2, config)?;
 
-let mut x = [0.0, 0.0];
-let outcome = solver.minimize(
-    |x| (1.0 - x[0]).powi(2) + 100.0 * (x[1] - x[0] * x[0]).powi(2),
-    &mut x,
-    &[-2.0, -2.0],
-    &[ 2.0,  2.0],
-);
+    let mut x = [0.0, 0.0];
+    let outcome = solver.minimize(
+        |x| (1.0 - x[0]).powi(2) + 100.0 * (x[1] - x[0] * x[0]).powi(2),
+        &mut x,
+        &[-2.0, -2.0],
+        &[ 2.0,  2.0],
+    );
 
-println!(
-    "f = {:.2e} at {:?} after {} evaluations, {} restarts",
-    outcome.f, x, outcome.n_eval, solver.last_restart_count(),
-);
+    println!(
+        "f = {:.2e} at {:?} after {} evaluations, {} restarts",
+        outcome.f, x, outcome.n_eval, solver.last_restart_count(),
+    );
+    Ok(())
+}
 ```
 
 The knobs live on `RestartConfig`:
@@ -155,8 +161,8 @@ restart here, and the guarantees around it, are this crate's own — see
 
 | Design | Detail |
 |---|---|
-| Faithful port | behaviour-for-behaviour port of PRIMA's modern-Fortran BOBYQA — the same trust-region method, Lagrange-model maintenance, geometry-restoring rescue, and box handling that earn BOBYQA its robustness. [Restarts](#restarts) are the one addition, off by default, and leave the port untouched when unused. One deliberate deviation, behind `Config::prima_parity`: no spurious rescue on a fully determined model (below) |
-| Bit-exact parity | with `Config::prima_parity = true`, reproduces PRIMA bit-for-bit across the golden `(x, f)` trajectory battery — every evaluation in order, the rescue path included — natively and on `wasm32-wasip1`. The default differs only at the maximum `npt = (n + 1)(n + 2) / 2`, so on every one-dimensional problem: there PRIMA's rescue test is decided by rounding alone, and the default uses Powell's original threshold instead |
+| Faithful port | behaviour-for-behaviour port of PRIMA's modern-Fortran BOBYQA — the same trust-region method, Lagrange-model maintenance, geometry-restoring rescue, and box handling that earn BOBYQA its robustness. [Restarts](#restarts), `ftol` stopping and `minimize_with_radius` are additions; all are opt-in and leave the port untouched when unused. One opt-in deviation from PRIMA sits behind `Config::prima_parity = false` (below) |
+| Bit-exact parity | with a default `Config`, reproduces PRIMA bit-for-bit across the golden `(x, f)` trajectory battery — every evaluation in order, the rescue path included — natively and on `wasm32-wasip1`. With `Config::prima_parity = false` the solver differs from PRIMA only at the maximum `npt = (n + 1)(n + 2) / 2` (so on every one-dimensional problem), where PRIMA's RESCUE test is decided by rounding; that field's documentation describes the change and what to expect from it |
 | Pure Rust | no C, Fortran, or system libraries; builds anywhere `cargo` does, including `wasm32-unknown-unknown` |
 | Zero dependencies | zero by default; the optional `libm` feature (the `no_std` math backend) is the only dependency, and only when you ask for it |
 | `no_std` + `alloc` | `default-features = false, features = ["libm"]` builds without `std` — see [`no_std` usage](#no_std-usage) |
@@ -212,9 +218,10 @@ This crate is three things, and it is worth being clear about which is which.
 is transcribed behaviour-for-behaviour from **PRIMA** (libprima, BSD-3-Clause) by Zaikun
 Zhang et al. — `v0.7.2+`, commit
 [`1d76fb88`](https://github.com/libprima/prima/commit/1d76fb88aeffb427cd17ed1e9d0d3b34f414913f),
-2026-05-27 — which in turn implements Powell's BOBYQA. None of it is original here, and that
-is the point: faithfulness is what earns BOBYQA its robustness, and the bit-exact parity
-battery exists to prove none was lost in translation.
+2026-05-27 — which in turn implements Powell's BOBYQA. Apart from the deviation behind
+`Config::prima_parity` (see [Design](#design)), none of it is original here, and that is the
+point: faithfulness is what earns BOBYQA its robustness, and the bit-exact parity battery
+exists to prove none was lost in translation.
 
 **The restart idea is Cartis, Fiala, Marteau, Roberts and Sheridan-Methven's**, from the
 Py-BOBYQA papers cited under [Citing](#citing): that a converged model-based solve can be

@@ -1,6 +1,7 @@
-//! Layer-0 F0a (spec §9): report `calvlag_noadd` invocations per `minimize` run, so the kernel
-//! recompute multiplicity (and the realized F0b/F0c saving) is measured deterministically — no
-//! wall-clock. Feature-gated; the counter and this test exist only under `count-kernels`.
+//! Report `calvlag_noadd` invocations per `minimize` run, so the kernel recompute multiplicity
+//! (and the saving from computing VLAG/DEN/BETA once per iteration and reusing them in
+//! `setdrop_tr` and `updateh`) is measured deterministically — no wall-clock.
+//! Feature-gated; the counter and this test exist only under `count-kernels`.
 //!
 //! Run: cargo test --features count-kernels --test `kernel_counts` -- --nocapture
 #![cfg(feature = "count-kernels")]

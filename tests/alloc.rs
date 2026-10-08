@@ -1,10 +1,10 @@
-//! The M2 zero-alloc test (SPEC §6.4): after `Bobyqa::new`, repeated `minimize` calls —
+//! The zero-alloc test: after `Bobyqa::new`, repeated `minimize` calls —
 //! the first included — perform **zero** heap allocations, on the trust-region warm path
 //! and on the rarely-taken rescue path alike.
 //!
 //! The crate itself is `#![forbid(unsafe_code)]`; this dev-only `GlobalAlloc`
 //! shim is why `unsafe_code = "forbid"` lives in `lib.rs` rather than the
-//! package-wide `[lints]` table (design §8.2). Installed for this test binary
+//! package-wide `[lints]` table. Installed for this test binary
 //! only.
 //!
 //! Everything lives in ONE `#[test]`: the counter is process-global, and libtest runs
@@ -13,6 +13,7 @@
 //! contract) and gets no zero-alloc assertion here.
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bobyqa::{Bobyqa, Config, RestartConfig, Status};
@@ -63,7 +64,7 @@ fn rosenbrock(x: &[f64]) -> f64 {
 
 #[test]
 fn minimize_allocates_zero_after_construction_on_warm_and_rescue_paths() {
-    // Scaffold sanity (M0): the counter observes an allocation at all.
+    // Scaffold sanity: the counter observes an allocation at all.
     let before = alloc_count();
     let v: Vec<u64> = Vec::with_capacity(32);
     assert!(
@@ -88,7 +89,7 @@ fn minimize_allocates_zero_after_construction_on_warm_and_rescue_paths() {
         assert_eq!(
             alloc_count(),
             before,
-            "sphere minimize allocated on call {call} (the zero-alloc warm path, SPEC §4)"
+            "sphere minimize allocated on call {call} (the zero-alloc warm path)"
         );
     }
 
@@ -105,13 +106,13 @@ fn minimize_allocates_zero_after_construction_on_warm_and_rescue_paths() {
     assert_eq!(
         alloc_count(),
         before,
-        "minimize_with_radius allocated (the zero-alloc warm path, SPEC §4)"
+        "minimize_with_radius allocated (the zero-alloc warm path)"
     );
 
     // Rescue path: the `booth_rescue` golden's exact problem (booth, npt 5, rho 0.5 -> 1e-12,
     // x0 = 0, upper[1] = 2.5 pins the optimum to the bound; 40 evals, converged). The capture
     // was built as a rescue stressor, and the solver is deterministic, so this run takes the
-    // rescue branch — proving it alloc-free too (M2 §6: zero means zero, not "zero on the
+    // rescue branch — proving it alloc-free too (zero means zero, not "zero on the
     // happy path"). The n_eval assert ties this run to the golden trajectory.
     let mut config = Config::new(2);
     config.npt = 5;
@@ -131,10 +132,18 @@ fn minimize_allocates_zero_after_construction_on_warm_and_rescue_paths() {
         assert_eq!(
             alloc_count(),
             before,
-            "rescue-path minimize allocated on call {call} (SPEC §6.4)"
+            "rescue-path minimize allocated on call {call}"
         );
     }
 
+    assert_restart_paths_allocate_zero();
+    assert_one_dimensional_paths_allocate_zero();
+    assert_cloned_solvers_allocate_zero();
+}
+
+/// The restart leg of the single zero-alloc test (split out for length; it must run inside
+/// that `#[test]`, see the module docs).
+fn assert_restart_paths_allocate_zero() {
     // Restart path: the same guarantee with restarts enabled. `Bobyqa::new` stays the sole
     // allocation site — the restart bookkeeping is a stack `RestartState`, the rebuild runs
     // `initxf` over the buffers `new` already sized for the opening solve, and the per-cycle
@@ -173,7 +182,38 @@ fn minimize_allocates_zero_after_construction_on_warm_and_rescue_paths() {
         );
     }
 
-    assert_one_dimensional_paths_allocate_zero();
+    // Reuse after an objective panic, on that same restart-enabled solver: the unwound call
+    // must leave the pre-sized boundary store in the solver, so the next solve — which
+    // restarts and pushes boundaries — still allocates nothing. The panic machinery itself
+    // allocates, so the counter is read only after the unwind is caught.
+    let mut calls = 0_usize;
+    let unwound = catch_unwind(AssertUnwindSafe(|| {
+        let mut x = [-1.2, 1.0];
+        solver.minimize(
+            |p: &[f64]| {
+                calls += 1;
+                assert!(calls < 3, "objective blew up (deliberate test panic)");
+                rosenbrock(p)
+            },
+            &mut x,
+            &[-5.0, -5.0],
+            &[5.0, 5.0],
+        )
+    }));
+    assert!(unwound.is_err(), "the objective's panic must propagate");
+    let before = alloc_count();
+    let mut x = [-1.2, 1.0];
+    let o = solver.minimize(rosenbrock, &mut x, &[-5.0, -5.0], &[5.0, 5.0]);
+    assert_eq!(o.status, Status::Converged, "restart call after an unwind");
+    assert!(
+        solver.last_restart_count() >= 1,
+        "restart call after an unwind: no restart fired, so the boundary store went unmeasured"
+    );
+    assert_eq!(
+        alloc_count(),
+        before,
+        "restart-enabled minimize allocated after an objective panic"
+    );
 }
 
 /// The 1-D leg of the single zero-alloc test (split out for length; it must run inside that
@@ -181,7 +221,7 @@ fn minimize_allocates_zero_after_construction_on_warm_and_rescue_paths() {
 fn assert_one_dimensional_paths_allocate_zero() {
     // One-dimensional path in both `Config::prima_parity` modes. n = 1 is always the
     // fully determined model, where parity mode takes PRIMA's RESCUE path on ordinary steps and
-    // the default takes Powell's factor instead; both must stay allocation-free.
+    // `false` does not; both must stay allocation-free.
     for prima_parity in [false, true] {
         let mut config = Config::new(1);
         config.rho_begin = 0.5;
@@ -216,4 +256,51 @@ fn assert_one_dimensional_paths_allocate_zero() {
             );
         }
     }
+}
+
+/// The clone leg of the single zero-alloc test (split out for length; it must run inside that
+/// `#[test]`, see the module docs).
+fn assert_cloned_solvers_allocate_zero() {
+    // A clone taken before any `minimize` call: the stores `new` sizes by capacity alone are
+    // then empty, so only a clone that carries their capacity over stays allocation-free.
+
+    // The restart boundary store, on the restart leg's schedule (which restarts on Rosenbrock).
+    let mut restart = RestartConfig::new();
+    restart.cycle_budget_frac = 0.0;
+    restart.stall_reductions = 2;
+    restart.max_restarts = 8;
+    let mut config = Config::new(2);
+    config.restart = Some(restart);
+    let mut solver = Bobyqa::new(2, config).expect("valid config").clone();
+    let before = alloc_count();
+    let mut x = [-1.2, 1.0];
+    let o = solver.minimize(rosenbrock, &mut x, &[-5.0, -5.0], &[5.0, 5.0]);
+    assert_eq!(o.status, Status::Converged, "cloned restart solver");
+    assert!(
+        solver.last_restart_count() >= 1,
+        "cloned restart solver: no restart fired, so the boundary store went unmeasured"
+    );
+    assert_eq!(
+        alloc_count(),
+        before,
+        "minimize allocated on a cloned restart-enabled solver"
+    );
+
+    // The two SETIJ pair stores, which hold entries only when npt > 2n + 1: the booth_rescue
+    // problem at npt = 6.
+    let mut config = Config::new(2);
+    config.npt = 6;
+    config.rho_begin = 0.5;
+    config.rho_end = 1e-12;
+    config.max_fun = 500;
+    let mut solver = Bobyqa::new(2, config).expect("valid config").clone();
+    let before = alloc_count();
+    let mut x = [0.0, 0.0];
+    let o = solver.minimize(booth, &mut x, &[-10.0, -10.0], &[10.0, 2.5]);
+    assert_eq!(o.status, Status::Converged, "cloned npt = 6 solver");
+    assert_eq!(
+        alloc_count(),
+        before,
+        "minimize allocated on a cloned npt = 6 solver"
+    );
 }

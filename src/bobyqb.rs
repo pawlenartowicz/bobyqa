@@ -22,7 +22,7 @@ use crate::powalg::{CalWs, calvlag_and_den_into, hess_mul_into, quadinc};
 use crate::rescue::{RescueWs, rescue};
 use crate::trustregion::{TrsboxWs, trrad, trsbox};
 use crate::update::{UpdateWs, tryqalt, updateh, updateq, updatexf};
-use crate::util::{checkexit, evaluate, try_capacity, try_vec, xinbd_into};
+use crate::util::{Reserved, checkexit, evaluate, revise_x0, try_capacity, try_vec, xinbd_into};
 use alloc::collections::TryReserveError;
 #[cfg(test)]
 use alloc::vec;
@@ -110,7 +110,7 @@ impl ErrbdWs {
 /// Field → Fortran-local map: the model state carries PRIMA's names (`bmat`/`zmat`/`xpt`/`hq`/
 /// `fval`/`pq`/`den`/`distsq`/`gopt`/`sl`/`su`/`xbase`/`d`/`xdrop`/`xosav`/`vlag`/`ij`);
 /// `xl`/`xu` are minimize's ±BOUNDMAX-clamped bounds (bobyqa.f90 L287-301), `xnew`/
-/// `xnew_clamped`/`fval_shift`/`xopt_copy` the main-loop body temporaries, `dxpt_q`/`pqdxpt`/
+/// `xnew_clamped`/`fval_shift` the main-loop body temporaries, `dxpt_q`/`pqdxpt`/
 /// `hqd` quadinc's scratch, `xmod` evaluate's MODERATEX copy.
 #[derive(Debug, Clone)]
 pub(crate) struct BobyqbWs {
@@ -132,7 +132,7 @@ pub(crate) struct BobyqbWs {
     xdrop: Vec<f64>,         // n
     xosav: Vec<f64>,         // n
     vlag: Vec<f64>,          // npt + n
-    ij: Vec<(usize, usize)>, // capacity max(0, npt - 2n - 1)
+    ij: Reserved<(usize, usize)>, // capacity max(0, npt - 2n - 1)
     dxpt_q: Vec<f64>,        // npt
     pqdxpt: Vec<f64>,        // npt
     hqd: Vec<f64>,           // n
@@ -140,22 +140,20 @@ pub(crate) struct BobyqbWs {
     xnew: Vec<f64>,          // n
     xnew_clamped: Vec<f64>,  // n
     fval_shift: Vec<f64>,    // npt
-    xopt_copy: Vec<f64>,     // n
-    best_x: Vec<f64>,        // n — D3's monotone incumbent record (hard-restart spec §5)
+    best_x: Vec<f64>,        // n — the monotone incumbent record
     cal: CalWs,
     shiftbase: ShiftbaseWs,
     errbd: ErrbdWs,
 }
 
 /// State threaded into `bobyqb` when restarts are enabled (`Config::restart` is `Some`).
-pub(crate) struct RestartState {
+pub(crate) struct RestartState<'a> {
     pub(crate) config: crate::RestartConfig,
-    pub(crate) restarts_done: usize,
     /// Best `fopt` at the end of the previous restart cycle (`None` for the opening solve),
     /// used by the settle test in `should_restart`.
     pub(crate) last_fopt: Option<f64>,
     /// Consecutive `rho` reductions whose `fopt` improvement stayed below `improve_rel_tol`
-    /// (stall-restart spec §4). Reset by any productive reduction and by every restart.
+    /// Reset by any productive reduction and by every restart.
     pub(crate) stall_count: usize,
     /// `fopt` at the previous `rho` reduction — the stall counter's comparison baseline
     /// (`None` before the solve's first reduction; reset to the `fopt` in hand at each restart
@@ -163,22 +161,23 @@ pub(crate) struct RestartState {
     pub(crate) stall_fopt: Option<f64>,
     /// Cumulative `nf` at the current cycle's start (0 for the opening solve) — the eval-cap
     /// trigger's baseline: both the cycle's spend and its allowance are measured from here
-    /// (hard-restart spec §4: the allowance is a fraction of the budget *remaining* at the
-    /// cycle's start, so successive cut points are geometric).
+    /// (the allowance is a fraction of the budget *remaining* at the cycle's
+    /// start, so successive cut points are geometric).
     pub(crate) nf_cycle_start: usize,
     /// Cumulative `nf` at each restart boundary, so a caller can diff it into per-cycle
-    /// evaluation counts. Owned by `Bobyqa` (sized `max_restarts + 1` at construction, the
-    /// crate's sole allocation site) and lent here by `mem::take`, so pushes — at most one per
-    /// restart — stay within capacity and the warm path stays zero-alloc.
-    pub(crate) cycle_boundaries: Vec<usize>,
+    /// evaluation counts; its length is the number of restarts done. Owned by `Bobyqa` (sized
+    /// `max_restarts + 1` at construction, the crate's sole allocation site) and borrowed
+    /// here, so pushes — at most one per restart — stay within capacity and the warm path
+    /// stays zero-alloc.
+    pub(crate) cycle_boundaries: &'a mut Vec<usize>,
 }
 
-impl RestartState {
+impl RestartState<'_> {
     /// Settle test + backstops. Restart iff a restart remains, budget remains, and the last
     /// completed cycle improved `fopt` by at least `improve_rel_tol` relative to `max(1, |fopt|)`.
     /// The opening solve (no prior cycle) always passes the improvement test.
     fn should_restart(&self, fopt: f64, nf: usize, maxfun: usize) -> bool {
-        if self.restarts_done >= self.config.max_restarts {
+        if self.cycle_boundaries.len() >= self.config.max_restarts {
             return false;
         }
         if nf >= maxfun {
@@ -188,16 +187,16 @@ impl RestartState {
             None => true, // opening solve reached rho_end; try the first restart
             Some(prev) => {
                 let improved = prev - fopt; // fopt <= prev (monotone incumbent)
-                improved >= self.config.improve_rel_tol * fopt.abs().max(1.0)
+                improved >= self.config.improve_rel_tol * math::abs(fopt).max(1.0)
             }
         }
     }
 
-    /// The stall trigger's bookkeeping, called at every `rho` reduction short of `rho_end`
-    /// (stall-restart spec §4): a reduction improving `fopt` by less than `improve_rel_tol`
+    /// The stall trigger's bookkeeping, called at every `rho` reduction short of `rho_end`:
+    /// a reduction improving `fopt` by less than `improve_rel_tol`
     /// relative to `max(1, |fopt|)` is a strike, any other resets the counter. Returns whether
     /// the strike count has reached `stall_reductions` — `should_restart` still gates the
-    /// actual restart (spec D4: with no restart remaining the stall trigger is inert).
+    /// actual restart (with no restart remaining the stall trigger is inert).
     fn note_reduction(&mut self, fopt: f64) -> bool {
         if self.config.stall_reductions == 0 {
             return false; // early trigger disabled: the rho_end-only schedule
@@ -206,7 +205,7 @@ impl RestartState {
             None => self.stall_count = 0, // the solve's first reduction has no baseline
             Some(prev) => {
                 let improved = prev - fopt; // fopt <= prev (monotone incumbent)
-                if improved >= self.config.improve_rel_tol * fopt.abs().max(1.0) {
+                if improved >= self.config.improve_rel_tol * math::abs(fopt).max(1.0) {
                     self.stall_count = 0;
                 } else {
                     self.stall_count += 1;
@@ -217,10 +216,11 @@ impl RestartState {
         self.stall_count >= self.config.stall_reductions
     }
 
-    /// The eval-cap trigger's test (hard-restart spec §7.1's fallback, §4's per-cycle budget):
-    /// the cycle has spent at least `cycle_budget_frac` of the evaluations that remained at
-    /// its start. `0.0` disables. Purely the trigger — `should_restart` still gates the
-    /// actual restart, exactly as it gates the stall trigger.
+    /// The eval-cap trigger's test: the cycle has spent at least `cycle_budget_frac` of the
+    /// evaluations that remained at its start. It catches a cycle that crawls without reducing
+    /// `rho`, which a trigger sited at `rho` reductions cannot see. `0.0` disables. Purely the
+    /// trigger — `should_restart` still gates the actual restart, exactly as it gates the stall
+    /// trigger.
     fn over_cycle_budget(&self, nf: usize, maxfun: usize) -> bool {
         let frac = self.config.cycle_budget_frac;
         #[expect(clippy::cast_precision_loss)] // budgets are far below 2^52
@@ -231,11 +231,10 @@ impl RestartState {
         }
     }
 
-    /// Record the cycle's best, count the restart, and reset the stall state (spec §4: counter
+    /// Record the cycle's best, count the restart, and reset the stall state (counter
     /// to 0, baseline to the `fopt` in hand — no strike carries into the new cycle).
     fn on_restart(&mut self, fopt: f64, nf: usize) {
         self.last_fopt = Some(fopt);
-        self.restarts_done += 1;
         self.stall_count = 0;
         self.stall_fopt = Some(fopt);
         self.nf_cycle_start = nf;
@@ -286,7 +285,6 @@ impl SolverWs {
                 xnew: try_vec(0.0, n)?,
                 xnew_clamped: try_vec(0.0, n)?,
                 fval_shift: try_vec(0.0, npt)?,
-                xopt_copy: try_vec(0.0, n)?,
                 best_x: try_vec(0.0, n)?,
                 cal: CalWs::new(n, npt)?,
                 shiftbase: ShiftbaseWs::new(n, npt)?,
@@ -340,7 +338,7 @@ fn redrho(rho_in: f64, rhoend: f64) -> f64 {
 /// PRIMA shiftbase.f90 L26 `shiftbase_lfqint`: shift XBASE to XBASE + XOPT, updating BMAT and HQ
 /// (PQ and ZMAT are unchanged). The optional IDZ is absent in BOBYQA (== 1, L87-91).
 /// XOPT is `xpt.col(kopt)`, read inside the body (Fortran L116).
-#[expect(clippy::too_many_arguments)] // out-params mirror the Fortran intent (rust.md §5)
+#[expect(clippy::too_many_arguments)] // out-params mirror the Fortran intent
 fn shiftbase(
     kopt: usize,
     xbase: &mut [f64],
@@ -492,9 +490,9 @@ fn shiftbase(
 
 /// PRIMA bobyqb.f90 L700 `errbd`: the bound used to test whether recent model errors are small
 /// (BOBYQA paper, around (6.8)-(6.11)). Called only on SHORTD/TRFAIL iterations (L352).
-#[expect(clippy::too_many_arguments)] // the argument list mirrors the Fortran signature (rust.md §5)
-#[expect(clippy::similar_names)] // PRIMA identifiers xpt/xopt are load-bearing (rust.md §5)
-#[expect(clippy::needless_range_loop)] // explicit indexed loops mirror PRIMA (rust.md §5)
+#[expect(clippy::too_many_arguments)] // the argument list mirrors the Fortran signature
+#[expect(clippy::similar_names)] // PRIMA identifiers xpt/xopt are load-bearing
+#[expect(clippy::needless_range_loop)] // explicit indexed loops mirror PRIMA
 fn errbd(
     crvmin: f64,
     d: &[f64],
@@ -535,7 +533,9 @@ fn errbd(
     }
 
     // PRIMA bobyqb.f90 L768: BFIRST = MAXVAL(ABS(MODERR_REC)) — scalar fill (ascending scan).
-    let max_abs_moderr = moderr_rec.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+    let max_abs_moderr = moderr_rec
+        .iter()
+        .fold(0.0_f64, |acc, &v| acc.max(math::abs(v)));
     bfirst.fill(max_abs_moderr);
 
     // PRIMA bobyqb.f90 L769: BFIRST(TRUELOC(XNEW <= SL)) = GNEW(...) * RHO — lower bound mask.
@@ -588,15 +588,23 @@ fn errbd(
     ebound
 }
 
-/// The hard-restart body (hard-restart spec §5): discard the quadratic model and rebuild it
+/// PRIMA bobyqb.f90 L246/L444/L603: `all(is_finite(gopt)) .and. all(is_finite(hq)) .and.
+/// all(is_finite(pq))`. Call sites keep the Fortran's NaN-bearing negation, `!model_is_finite(..)`.
+fn model_is_finite(gopt: &[f64], hq: &Mat, pq: &[f64]) -> bool {
+    gopt.iter().all(|v| v.is_finite())
+        && hq.data().iter().all(|v| v.is_finite())
+        && pq.iter().all(|v| v.is_finite())
+}
+
+/// The hard-restart body: discard the quadratic model and rebuild it
 /// from the incumbent at `rho_begin`, on the existing workspace.
 ///
-/// Reachable only from the restart hook, so `Bobyqa` (`restart == None`) never runs a line of
+/// Reachable only from the restart hook, so a solve with `restart == None` never runs a line of
 /// it and stays bit-exact. Allocation-free: `initxf`/`initq`/`inith` re-initialize every
 /// output in place, so the opening three-call sequence is re-entrant as written.
 ///
-/// Order of business (each step spec §5's):
-/// 1. Save the incumbent into the monotone best record (D3) — the seed revision below can
+/// Order of business:
+/// 1. Save the incumbent into the monotone best record — the seed revision below can
 ///    move the rebuild off it, and every rebuilt point may be worse.
 /// 2. Seed `x` with the incumbent and apply the same bound-distance revision `prepare_call`
 ///    applies to a fresh start point (distance to each inactive bound forced to 0 or
@@ -639,9 +647,7 @@ fn hard_rebuild<F: FnMut(&[f64]) -> f64>(
     best_x: &mut [f64],
     iws: &mut InitWs,
 ) -> i32 {
-    let n = xpt.nrows();
-
-    // D3: fold the incumbent into the record before the rebuild can lose it. The record is
+    // Fold the incumbent into the record before the rebuild can lose it. The record is
     // non-increasing across rebuilds by construction (min of itself and the incumbent); the
     // assertion pins that against future edits.
     let prev_best = *best_f;
@@ -651,27 +657,14 @@ fn hard_rebuild<F: FnMut(&[f64]) -> f64>(
     }
     debug_assert!(
         *best_f <= prev_best,
-        "D3: the best record must be non-increasing"
+        "the best record must be non-increasing"
     );
 
-    // Step 2: the incumbent in original coordinates, then preproc.f90 L341-350's revision
-    // (HONOUR_X0 = FALSE), transcribed from `prepare_call` — the hook is inside `bobyqb`,
-    // so the seed does not pass through `prepare_call` on its own.
+    // Step 2: the incumbent in original coordinates, then the start-point revision
+    // `prepare_call` applies — the hook is inside `bobyqb`, so the seed does not pass through
+    // `prepare_call` on its own.
     xinbd_into(xbase, xpt.col(*kopt), xl, xu, sl, su, x);
-    for i in 0..n {
-        if x[i] <= xl[i] + 0.5 * rhobeg {
-            x[i] = xl[i];
-        } else if x[i] < xl[i] + rhobeg {
-            x[i] = xl[i] + rhobeg;
-        }
-    }
-    for i in 0..n {
-        if x[i] >= xu[i] - 0.5 * rhobeg {
-            x[i] = xu[i];
-        } else if x[i] > xu[i] - rhobeg {
-            x[i] = xu[i] - rhobeg;
-        }
-    }
+    revise_x0(x, xl, xu, rhobeg);
 
     // Step 3: the opening sequence, on the remaining budget.
     let (kopt_new, nf_init, mut subinfo) = initxf(
@@ -695,13 +688,10 @@ fn hard_rebuild<F: FnMut(&[f64]) -> f64>(
     xinbd_into(xbase, xpt.col(*kopt), xl, xu, sl, su, x);
     *f = fval[*kopt];
     if subinfo == INFO_DFT {
-        let _ = inith(ij, xpt, bmat, zmat, iws);
-        let _ = initq(ij, fval, xpt, gopt, hq, pq, iws);
+        inith(ij, xpt, bmat, zmat, iws);
+        initq(ij, fval, xpt, gopt, hq, pq, iws);
         // PRIMA L246: literal NaN-bearing negation of the model-finiteness test.
-        if !(gopt.iter().all(|v| v.is_finite())
-            && hq.data().iter().all(|v| v.is_finite())
-            && pq.iter().all(|v| v.is_finite()))
-        {
+        if !model_is_finite(gopt, hq, pq) {
             subinfo = NAN_INF_MODEL;
         }
     }
@@ -725,10 +715,10 @@ fn publish(radius: Option<&Cell<TrustRadius>>, rho: f64, delta: f64) {
 ///
 /// Never when `ws` was built by `SolverWs::new(n, npt)` for this `(n, npt)` — the workspace
 /// dimensions are then consistent with `x` and `npt`.
-// The lints below stem from faithful-port discipline (rust.md §5): wide out-param signature,
+// The lints below stem from faithful-port discipline: wide out-param signature,
 // one long Fortran body, PRIMA's identifiers and its `!(a > b)` NaN-propagating negations, and
 // explicit indexed loops that mirror PRIMA's array order.
-#[expect(clippy::too_many_arguments)] // out-params mirror the Fortran intent (rust.md §5)
+#[expect(clippy::too_many_arguments)] // out-params mirror the Fortran intent
 #[expect(clippy::too_many_lines)] // one Fortran body, transcribed block-for-block
 #[expect(clippy::neg_cmp_op_on_partial_ord)] // `!(a > b)` is load-bearing for NaN — never `a <= b`
 #[expect(clippy::needless_range_loop)] // explicit indexed loops mirror PRIMA
@@ -739,7 +729,7 @@ pub(crate) fn bobyqb<F: FnMut(&[f64]) -> f64>(
     eta1: f64,
     eta2: f64,
     ftarget: f64,
-    // ftol spec §2: `Some((rel, abs))` enables the stage-granularity f-tolerance stop at
+    // `Some((rel, abs))` enables the stage-granularity f-tolerance stop at
     // the rho-reduction site; `None` (the only value `Config` with both fields unset can
     // produce) never reaches the check, keeping the default path literally unchanged.
     ftol: Option<(f64, f64)>,
@@ -749,15 +739,15 @@ pub(crate) fn bobyqb<F: FnMut(&[f64]) -> f64>(
     rhoend: f64,
     x: &mut [f64],
     ws: &mut SolverWs,
-    mut restart: Option<&mut RestartState>,
+    mut restart: Option<&mut RestartState<'_>>,
     // `Bobyqa::minimize_with_radius`: `(rho, delta)` published before every evaluation
     // (`publish`), read by the caller's objective wrapper. Write-only here, so `None`
     // (`Bobyqa::minimize`) and `Some` take the same path through the solve.
     radius: Option<&Cell<TrustRadius>>,
     // `Config::prima_parity`. `true` only when parity is off AND `npt` is the maximum
-    // `(n + 1)(n + 2) / 2`: the trust-region RESCUE test then uses Powell's factor 0.5 (see
-    // the site below). `false` runs PRIMA's test literally.
-    full_model_rescue_half: bool,
+    // `(n + 1)(n + 2) / 2`: the trust-region RESCUE test then uses Powell's factor 0.5 (the site
+    // below). `false` runs PRIMA's test literally.
+    full_model_deviations: bool,
 ) -> (f64, usize, i32) {
     let n = x.len();
 
@@ -797,7 +787,6 @@ pub(crate) fn bobyqb<F: FnMut(&[f64]) -> f64>(
         xnew,
         xnew_clamped,
         fval_shift,
-        xopt_copy,
         best_x,
         cal,
         shiftbase: sbws,
@@ -847,13 +836,10 @@ pub(crate) fn bobyqb<F: FnMut(&[f64]) -> f64>(
 
     // PRIMA bobyqb.f90 L239-249: finish the model initialization if INITXF completed normally.
     if subinfo == INFO_DFT {
-        let _ = inith(ij, xpt, bmat, zmat, iws);
-        let _ = initq(ij, fval, xpt, gopt, hq, pq, iws);
+        inith(ij, xpt, bmat, zmat, iws);
+        initq(ij, fval, xpt, gopt, hq, pq, iws);
         // PRIMA L246: literal NaN-bearing negation of the model-finiteness test.
-        if !(gopt.iter().all(|v| v.is_finite())
-            && hq.data().iter().all(|v| v.is_finite())
-            && pq.iter().all(|v| v.is_finite()))
-        {
+        if !model_is_finite(gopt, hq, pq) {
             subinfo = NAN_INF_MODEL;
         }
     }
@@ -894,7 +880,7 @@ pub(crate) fn bobyqb<F: FnMut(&[f64]) -> f64>(
     // `maxfun * 2` formula in several cases (e.g. n=2, max_restarts=100..200, max_fun=400 —
     // cut off at 90-112 restarts with nf far below the budget); scaling by `max_restarts + 1`
     // (opening solve + every restart cycle) eliminated every occurrence over the same sweep.
-    // Restart path only — `restart == None` (`Bobyqa`) keeps the exact original formula, so the
+    // Restart path only — `restart == None` keeps the exact original formula, so the
     // restart-off surface stays bit-exact.
     let maxtr = match restart.as_deref() {
         Some(rs) => maxfun
@@ -907,7 +893,7 @@ pub(crate) fn bobyqb<F: FnMut(&[f64]) -> f64>(
     // PRIMA L327: DNORM is set every iteration before use (the Fortran leaves it undefined).
     let mut dnorm = 0.0;
 
-    // Restart machinery (inert with `restart == None`): D3's monotone incumbent record
+    // Restart machinery (inert with `restart == None`): the monotone incumbent record
     // (`best_x` in the workspace holds the point, in original coordinates), and the
     // one-restart-body flag — the stall/settle triggers at the rho-reduction hook below set
     // it and `continue`, so the body exists once, at the top of the loop, where the eval-cap
@@ -915,7 +901,7 @@ pub(crate) fn bobyqb<F: FnMut(&[f64]) -> f64>(
     let mut best_f = REALMAX;
     let mut fire_restart = false;
 
-    // ftol stage tracker (ftol spec §2): best f at the moment the current rho stage began.
+    // ftol stage tracker: best f at the moment the current rho stage began.
     // `None` before the first completed stage — the guard against triggering on stage one —
     // and reset to `None` at every restart rebuild (a new cycle's first stage is a first
     // stage). Only ever read/written when `ftol.is_some()`, so the default path is inert.
@@ -923,15 +909,15 @@ pub(crate) fn bobyqb<F: FnMut(&[f64]) -> f64>(
 
     // PRIMA bobyqb.f90 L324: begin the iterative procedure.
     for _tr in 1..=maxtr {
-        // The restart body, entered by any trigger (hard-restart spec §4: a schedule is a set
+        // The restart body, entered by any trigger (a schedule is a set
         // of triggers, every trigger drives the same restart). The eval-cap trigger is
-        // consulted right here, every iteration — §7.1 measured that the off-pace solves take
-        // no rho reductions after their opening ones, so a reduction-sited trigger has no
+        // consulted right here, every iteration — a solve that crawls takes
+        // no rho reductions after its opening ones, so a reduction-sited trigger has no
         // site to fire from. `should_restart` gates every fire (settle test + backstops).
         //
         // THE REBUILD-ROOM RULE, stated once here and cited at the `reduce_rho` trigger: a
-        // restart must have room to finish its `initxf` rebuild (`maxfun - nf > npt`; spec
-        // §4). Without it the rebuild spends the rest of the budget re-sampling and returns no
+        // restart must have room to finish its `initxf` rebuild (`maxfun - nf > npt`).
+        // Without it the rebuild spends the rest of the budget re-sampling and returns no
         // usable cycle at all, so short of that room the trigger is inert and the cycle runs on.
         if let Some(rs) = restart.as_deref_mut() {
             if !fire_restart
@@ -987,7 +973,7 @@ pub(crate) fn bobyqb<F: FnMut(&[f64]) -> f64>(
                 ratio = -1.0;
                 knew_tr = None;
                 itest = 0;
-                // ftol spec §2: the rebuilt cycle's first stage is a first stage — no
+                // The rebuilt cycle's first stage is a first stage — no
                 // baseline carries across a restart.
                 ftol_stage_f = None;
                 if subinfo != INFO_DFT {
@@ -1000,7 +986,7 @@ pub(crate) fn bobyqb<F: FnMut(&[f64]) -> f64>(
                 // fire on a restart cycle. The pending tail step is deliberately deferred to
                 // the true final termination; its result never feeds the model, only the
                 // returned `x`/`f`, and the post-loop selection already picks the best of
-                // the tail eval, the incumbent, and (D3) the record.
+                // the tail eval, the incumbent, and the record.
                 continue;
             }
         }
@@ -1025,12 +1011,15 @@ pub(crate) fn bobyqb<F: FnMut(&[f64]) -> f64>(
         let qred = -quadinc(d, xpt, gopt, pq, hq, dxpt_q, pqdxpt, hqd);
         // PRIMA bobyqb.f90 L333: the literal 1.0E-6 has no _RP suffix — gfortran evaluates it in
         // SINGLE precision (= 9.99999997475242708e-07), and the oracle binary compares against that.
-        let trfail = !(qred > f64::from(1.0e-6_f32) * (rho * rho)); // literal NaN-bearing negation (rust.md §5).
+        // Not `qred <= ...`: a NaN `qred` must set `trfail`, as PRIMA's `.not.` does.
+        let trfail = !(qred > f64::from(1.0e-6_f32) * (rho * rho));
 
         if shortd || trfail {
             // PRIMA bobyqb.f90 L347-350: D is short — adjust DELTA.
             #[expect(clippy::assign_op_pattern)]
-            // L347: operand order is TENTH * delta (rust.md §5)
+            // L347: operand order is TENTH * delta, PRIMA's expression shape, kept for line-by-line
+            // diffing. The lint is expected because PRIMA's expression shape is kept; IEEE
+            // multiplication commutes, so `delta *= 0.1` would give the same bits.
             {
                 delta = 0.1 * delta;
             }
@@ -1094,7 +1083,7 @@ pub(crate) fn bobyqb<F: FnMut(&[f64]) -> f64>(
             // denominator. One kernel, not two (calvlag_into + calden_into recompute the same H·w)
             // — bit-identical.
             let ref_beta = calvlag_and_den_into(kopt, bmat, d, xpt, zmat, cal, vlag, den);
-            // Layer-0 spec §5 (Tier B): the vlag/den/ref_beta just computed are reusable by
+            // Same-iteration reuse: the vlag/den/ref_beta just computed are reusable by
             // setdrop_tr/updateh below ONLY while (kopt, d, xpt, zmat, bmat) stay unchanged. The
             // rescue branch (below) invalidates them; this flag is cleared there if rescue runs.
             let mut model_unchanged = true;
@@ -1113,7 +1102,7 @@ pub(crate) fn bobyqb<F: FnMut(&[f64]) -> f64>(
             // determined model the test uses Powell's original factor HALF (PRIMA's commented
             // alternatives at L401-402), keeping the `ximproved` gate and the non-finite guard.
             // The `else` arm is PRIMA's L397 verbatim.
-            let den_ok = if full_model_rescue_half {
+            let den_ok = if full_model_deviations {
                 den.iter().any(|&v| v > 0.5 * vmax)
             } else {
                 den.iter().any(|&v| v > vmax)
@@ -1199,16 +1188,23 @@ pub(crate) fn bobyqb<F: FnMut(&[f64]) -> f64>(
                 for k in 0..npt {
                     fval_shift[k] = fval[k] - fval[kopt];
                 }
-                xopt_copy.copy_from_slice(xpt.col(kopt));
                 tryqalt(
-                    bmat, fval_shift, ratio, sl, su, xopt_copy, xpt, zmat, &mut itest, gopt, hq,
-                    pq, uws,
+                    bmat,
+                    fval_shift,
+                    ratio,
+                    sl,
+                    su,
+                    xpt.col(kopt),
+                    xpt,
+                    zmat,
+                    &mut itest,
+                    gopt,
+                    hq,
+                    pq,
+                    uws,
                 );
                 // PRIMA bobyqb.f90 L444-447: literal NaN-bearing model-finiteness test.
-                if !(gopt.iter().all(|v| v.is_finite())
-                    && hq.data().iter().all(|v| v.is_finite())
-                    && pq.iter().all(|v| v.is_finite()))
-                {
+                if !model_is_finite(gopt, hq, pq) {
                     info = NAN_INF_MODEL;
                     break;
                 }
@@ -1272,8 +1268,10 @@ pub(crate) fn bobyqb<F: FnMut(&[f64]) -> f64>(
             geostep(knew_geo, kopt, bmat, delbar, sl, su, xpt, zmat, d, gws);
 
             // PRIMA bobyqb.f90 L546-548: VLAG and DEN, then call RESCUE if rounding has damaged the
-            // denominator. One fused kernel.
-            calvlag_and_den_into(kopt, bmat, d, xpt, zmat, cal, vlag, den);
+            // denominator. One fused kernel; its VLAG and BETA are handed to `updateh` below,
+            // which runs only when RESCUE does not, so (kopt, d, xpt, zmat, bmat) are unchanged
+            // at that point.
+            let geo_beta = calvlag_and_den_into(kopt, bmat, d, xpt, zmat, cal, vlag, den);
             let vlag_abs_sum: f64 = vlag.iter().map(|v| math::abs(*v)).sum();
             let to_rescue = !(vlag_abs_sum.is_finite()
                 && den[knew_geo] > 0.5 * (vlag[knew_geo] * vlag[knew_geo]));
@@ -1326,7 +1324,16 @@ pub(crate) fn bobyqb<F: FnMut(&[f64]) -> f64>(
                 // PRIMA bobyqb.f90 L598-606: update [BMAT, ZMAT], [FVAL, XPT, KOPT], [GOPT, HQ, PQ].
                 xdrop.copy_from_slice(xpt.col(knew_geo));
                 xosav.copy_from_slice(xpt.col(kopt));
-                let _ = updateh(Some(knew_geo), kopt, d, xpt, bmat, zmat, uws, None);
+                let _ = updateh(
+                    Some(knew_geo),
+                    kopt,
+                    d,
+                    xpt,
+                    bmat,
+                    zmat,
+                    uws,
+                    Some((vlag.as_slice(), geo_beta)),
+                );
                 for i in 0..n {
                     xnew_clamped[i] = sl[i].max(su[i].min(xosav[i] + d[i]));
                 }
@@ -1357,10 +1364,7 @@ pub(crate) fn bobyqb<F: FnMut(&[f64]) -> f64>(
                 // No TRYQALT here: PRIMA bobyqb.f90 L598-606 (the geometry branch) has no TRYQALT —
                 // unlike the trust-region step, which calls it after updateq.
                 // PRIMA bobyqb.f90 L603-606: literal NaN-bearing model-finiteness test.
-                if !(gopt.iter().all(|v| v.is_finite())
-                    && hq.data().iter().all(|v| v.is_finite())
-                    && pq.iter().all(|v| v.is_finite()))
-                {
+                if !model_is_finite(gopt, hq, pq) {
                     info = NAN_INF_MODEL;
                     break;
                 }
@@ -1369,8 +1373,8 @@ pub(crate) fn bobyqb<F: FnMut(&[f64]) -> f64>(
 
         // PRIMA bobyqb.f90 L612-625: reduce RHO; update DELTA at the same time.
         if reduce_rho {
-            // The ftol stage check (ftol spec §2), the feature's single code site. Placement
-            // is spec-pinned: BEFORE the restart hook (ftol wins when both would fire at the
+            // The ftol stage check, the feature's single code site. Placement
+            // is fixed: BEFORE the restart hook (ftol wins when both would fire at the
             // same reduction — FtolReached is converged-class and must not spend a restart),
             // and skipped at `rho <= rhoend` (the ladder finishing exits Converged below, as
             // today; FtolReached only fires where it actually saves evaluations). `df >= 0`
@@ -1381,7 +1385,7 @@ pub(crate) fn bobyqb<F: FnMut(&[f64]) -> f64>(
                     let fopt = fval[kopt];
                     if let Some(stage_start) = ftol_stage_f {
                         let df = stage_start - fopt;
-                        if df <= ftol_rel * fopt.abs().max(1.0) + ftol_abs {
+                        if df <= ftol_rel * math::abs(fopt).max(1.0) + ftol_abs {
                             info = FTOL_REACHED;
                             break;
                         }
@@ -1389,11 +1393,11 @@ pub(crate) fn bobyqb<F: FnMut(&[f64]) -> f64>(
                     ftol_stage_f = Some(fopt);
                 }
             }
-            // The restart hook (hard-restart spec §4, stall-restart spec §4).
+            // The restart hook.
             // `Bobyqa` with `restart: None` → inert, and the block reduces RHO exactly as
             // PRIMA does. Two triggers share this one restart body: at `rho <= rhoend` the
             // settle test alone decides; at an ordinary reduction the stall counter must
-            // fill first AND `should_restart` still gates it (stall-restart spec D4 — once
+            // fill first AND `should_restart` still gates it (once
             // no restart remains, the cycle runs to `rho_end`).
             //
             // The `maxfun - nf > npt` conjunct is the rebuild-room rule stated at the
@@ -1442,12 +1446,12 @@ pub(crate) fn bobyqb<F: FnMut(&[f64]) -> f64>(
             xopt_sq += xpt[[i, kopt]] * xpt[[i, kopt]];
         }
         if xopt_sq >= 1.0e3 * (delta * delta) {
-            // PRIMA L634-635: read XPT(:, KOPT) before mutating SL/SU (the Fortran reads the
-            // un-shifted column; the borrow checker forces the copy regardless).
-            xopt_copy.copy_from_slice(xpt.col(kopt));
+            // PRIMA L634-635: SL/SU are revised from the un-shifted XPT(:, KOPT), which
+            // SHIFTBASE zeroes afterwards.
+            let xopt = xpt.col(kopt);
             for i in 0..n {
-                sl[i] = (sl[i] - xopt_copy[i]).min(0.0);
-                su[i] = (su[i] - xopt_copy[i]).max(0.0);
+                sl[i] = (sl[i] - xopt[i]).min(0.0);
+                su[i] = (su[i] - xopt[i]).max(0.0);
             }
             shiftbase(kopt, xbase, xpt, zmat, bmat, pq, hq, sbws);
             for i in 0..n {
@@ -1476,7 +1480,7 @@ pub(crate) fn bobyqb<F: FnMut(&[f64]) -> f64>(
         f = fval[kopt];
     }
 
-    // D3 (hard-restart spec §5): the returned point is a monotone incumbent across cycles —
+    // The returned point is a monotone incumbent across cycles —
     // the better of the record saved before each hard rebuild and anything a later cycle
     // produced (the same comparison the `fval[kopt] < f` choice above makes with the tail
     // eval, extended to the record). `best_f` stays REALMAX with `restart == None`, so this
@@ -1487,8 +1491,8 @@ pub(crate) fn bobyqb<F: FnMut(&[f64]) -> f64>(
         f = best_f;
     }
 
-    // Restart status fold (spec §3.2). Restart-only: `Bobyqa` passes `restart = None`, so
-    // this cannot alter a single byte of its result. Reaching the restart hook at all means the
+    // Restart status fold. Restart-only: with `restart == None` this
+    // cannot alter a single byte of the result. Reaching the restart hook at all means the
     // cycle before it had satisfied PRIMA's `rho <= rhoend` convergence test, holding the very
     // incumbent this call returns — FVAL(KOPT) is monotone, and a later cycle can only replace it
     // with a strictly better *evaluated* point (`updatexf` re-points KOPT on strict improvement
@@ -1498,13 +1502,13 @@ pub(crate) fn bobyqb<F: FnMut(&[f64]) -> f64>(
     // hypothetical — at `npt = (n+1)(n+2)/2` the interpolation set is fully determined and
     // machine-precision-tight by the time it converges, and PRIMA's own denominator guard trips
     // twice running there (RESCUE cannot repair it), which without this fold would surface a
-    // converged, bit-identical-to-`Bobyqa` answer as `ModelDegenerate`. Pinned by
+    // converged, bit-identical-to-restarts-off answer as `ModelDegenerate`. Pinned by
     // `tests/restart.rs::a_restart_never_downgrades_a_converged_answer_to_model_degenerate`.
     // Deliberately NOT folded: MAXFUN_REACHED / MAXTR_REACHED and FTARGET_ACHIEVED (the documented
-    // backstops), and any breakdown during the OPENING solve (`restarts_done == 0`) — that one is
-    // exactly what `Bobyqa` would report, so it must still surface.
+    // backstops), and any breakdown during the OPENING solve (no boundary recorded) — that one is
+    // exactly what a solve with restarts off would report, so it must still surface.
     if let Some(rs) = restart.as_deref() {
-        if rs.restarts_done >= 1
+        if !rs.cycle_boundaries.is_empty()
             && matches!(
                 info,
                 DAMAGING_ROUNDING | NAN_INF_MODEL | NAN_INF_X | NAN_INF_F
@@ -1587,7 +1591,7 @@ mod tests {
     #[test]
     fn errbd_pins_the_bsecond_and_active_bound_paths() {
         // The zero-xpt/pq/hq cases in errbd_takes_the_interior_bound_and_crvmin_arms leave BSECOND
-        // (L451-463) and the HM term of GNEW (L427-431) identically zero, so mutations there survive.
+        // (L771) and the HM term of GNEW (L767) identically zero, so mutations there survive.
         // Three n=1 cases with nonzero xpt/pq/hq, all values exactly representable, pin those paths:
         // (a) interior, nonzero BSECOND: xpt=[[3]], pq=[2], hq=1, rho=2; v[0]=9*2=18,
         //     bsecond[0]=0.5*(1+18)*4=38, bfirst[0]=0 => ebound=38.
@@ -1610,7 +1614,7 @@ mod tests {
             &mut ws1,
         );
         assert_eq!(e, 38.0);
-        // (b) upper bound active, exercises GNEW=GOPT+HM (L431) and BFIRST=-GNEW*RHO (L447):
+        // (b) upper bound active, exercises GNEW=GOPT+HM (L767) and BFIRST=-GNEW*RHO (L770):
         //     d=0.5, hq=2 => hm=1, gnew=2; xnew=0.5>=su=0.25 => bfirst=-1; bsecond=0.5*2*0.25=0.25;
         //     ebound=max(-1,-0.75)=-0.75.
         let mut hq2 = Mat::zeros(1, 1);
@@ -1632,7 +1636,7 @@ mod tests {
             &mut ws2,
         );
         assert_eq!(e, -0.75);
-        // (c) lower bound active, exercises BFIRST=GNEW*RHO (L441): d=-0.5, hq=2 => hm=-1, gnew=2;
+        // (c) lower bound active, exercises BFIRST=GNEW*RHO (L769): d=-0.5, hq=2 => hm=-1, gnew=2;
         //     xnew=-0.5<=sl=-0.25 => bfirst=1; bsecond=0.25; ebound=max(1,1.25)=1.25.
         let mut hq3 = Mat::zeros(1, 1);
         hq3[[0, 0]] = 2.0;
@@ -1665,11 +1669,11 @@ mod tests {
         assert_eq!(redrat(f64::INFINITY, f64::INFINITY, 0.1), 1.0); // +inf/+inf (L63)
         assert_eq!(redrat(f64::NEG_INFINITY, f64::INFINITY, 0.1), -REALMAX); // -inf/+inf (L65)
         assert_eq!(redrat(1.0, 2.0, 0.1), 0.5); // the ordinary case
-        // ared == 0.0 is NOT > 0.0 in IEEE, so the bad-pred arm (L208) returns -REALMAX, not
+        // ared == 0.0 is NOT > 0.0 in IEEE, so the bad-pred arm returns -REALMAX, not
         // HALF*rshrink — a `>`->`>=` mutation would wrongly return 0.05.
         assert_eq!(redrat(0.0, -1.0, 0.1), -REALMAX);
         assert_eq!(redrat(0.0, f64::NAN, 0.1), -REALMAX);
-        // Exactly ONE operand infinite -> ordinary division, NOT the both-infinite branch (L209). The
+        // Exactly ONE operand infinite -> ordinary division, NOT the both-infinite branch. The
         // `(+inf||finite)` cases below pin that the special-case && chain stays an &&, not an ||.
         assert_eq!(redrat(1.0, f64::INFINITY, 0.1), 0.0); // 1/+inf
         assert_eq!(redrat(f64::INFINITY, 2.0, 0.1), f64::INFINITY); // +inf/2 (finite positive pred)
@@ -1708,7 +1712,7 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::similar_names)] // xpt/xopt are PRIMA identifiers (rust.md §5)
+    #[expect(clippy::similar_names)] // xpt/xopt are PRIMA identifiers
     fn shiftbase_zeroes_the_kopt_column_moves_xbase_and_preserves_the_model_hessian() {
         let (n, npt, kopt) = (2, 6, 3);
         let xpt = Mat::from_col_major(

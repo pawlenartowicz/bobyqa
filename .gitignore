@@ -4,3 +4,12 @@
 # cargo-mutants per-run scratch output (the .cargo/mutants.toml config IS tracked)
 /mutants.out/
 /mutants.out.old/
+
+# PRIMA oracle byproducts — oracle/PRIMA_VERSION is the durable record of the pin
+/oracle/prima/
+/oracle/build*/
+/oracle/driver
+/oracle/driver-*
+/oracle/bobyqa_states.dump
+/oracle/__pycache__/
+/oracle/rusttime/target/

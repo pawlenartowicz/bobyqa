@@ -1,8 +1,8 @@
 //! `update.f90` (PRIMA bobyqa module): `updateh`, `updatexf`, `updateq`, `tryqalt` — the updates
-//! when XPT(:, KNEW) becomes XNEW = XOPT + D (design §5).
+//! when XPT(:, KNEW) becomes XNEW = XOPT + D.
 //!
 //! Index convention: all indices 0-based (`knew`, `kopt`, `k`); PRIMA's `KNEW = 0` sentinel is
-//! `Option<usize>` (design §3.2); the diff tests translate the 1-based dump values. The optional
+//! `Option<usize>`; the diff tests translate the 1-based dump values. The optional
 //! `INFO` out-arg is returned as `i32` (`consts.rs` values); the `bobyqb.f90` call sites on this
 //! pin pass it nowhere, so the state corpus has no `info` field (oracle/README.md).
 use crate::consts::{DAMAGING_ROUNDING, INFO_DFT};
@@ -17,9 +17,9 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 /// Reused scratch for the update.f90 routines — PRIMA's per-call locals, hoisted to the solver
-/// workspace (rust.md §4). Lifetime and contents per call are identical to the Fortran locals;
-/// only the allocation site moves: each field is re-initialized at the original allocation
-/// site, per call. Field → Fortran-local map: `hcol`/`vlag`/`v1`/`v2` are updateh's
+/// workspace so that `minimize` performs no heap allocation after `Bobyqa::new`. Lifetime and
+/// contents per call are identical to the Fortran locals; only the allocation site moves: each
+/// field is re-initialized at the original allocation site, per call. Field → Fortran-local map: `hcol`/`vlag`/`v1`/`v2` are updateh's
 /// HCOL/VLAG/V1/V2; `pqinc` updateq's PQINC; `pgopt`/`pqalt`/`galt`/`pgalt` tryqalt's
 /// PGOPT/PQALT/GALT/PGALT; `zrow` the ZMAT(KNEW, :) row-extraction temp (updateh L119,
 /// updateq L356), `zmat_zrow`/`inner` the MATPROD temps, `hm` the `HESS_MUL` results
@@ -68,8 +68,7 @@ impl UpdateWs {
 
 /// PRIMA update.f90 L22 `updateh`: update BMAT and ZMAT when XPT(:, KNEW) changes to XNEW.
 /// Returns `info`: `INFO_DFT` on success, `DAMAGING_ROUNDING` if the denominator was bad.
-#[expect(clippy::too_many_arguments)] // out-params mirror the Fortran intent (rust.md §5)
-#[expect(clippy::needless_range_loop)] // explicit indexed loops mirror PRIMA (rust.md §5)
+#[expect(clippy::too_many_arguments)] // out-params mirror the Fortran intent
 pub(crate) fn updateh(
     knew: Option<usize>,
     kopt: usize,
@@ -78,7 +77,10 @@ pub(crate) fn updateh(
     bmat: &mut Mat,
     zmat: &mut Mat,
     ws: &mut UpdateWs,
-    precomputed: Option<(&[f64], f64)>, // (vlag with +1, beta) from bobyqb this iteration; spec §5
+    // (vlag with +1, beta) from bobyqb this iteration. Lets `updateh` skip recomputing VLAG/BETA
+    // when bobyqb already computed them for the same (kopt, d, xpt, zmat, bmat) with no RESCUE
+    // since; `None` recomputes.
+    precomputed: Option<(&[f64], f64)>,
 ) -> i32 {
     let n = xpt.nrows();
     let npt = xpt.ncols();
@@ -107,8 +109,8 @@ pub(crate) fn updateh(
     // PRIMA update.f90 L120: HCOL(NPT+1:NPT+N) = BMAT(:, KNEW).
     hcol[npt..npt + n].copy_from_slice(bmat.col(knew));
 
-    // PRIMA update.f90 L123-124: BETA and VLAG (kopt is already 0-based). Layer-0 spec §5
-    // (Tier B): reuse bobyqb's same-iteration values (kref = kopt, same d/xpt/zmat/bmat, no
+    // PRIMA update.f90 L123-124: BETA and VLAG (kopt is already 0-based).
+    // Same-iteration reuse: bobyqb's values (kref = kopt, same d/xpt/zmat/bmat, no
     // rescue since) by COPY — bit-identical, saves two kernels. Order in the recompute branch
     // is calbeta THEN calvlag (PRIMA's order); the reuse branch is order-free (pure copy).
     let beta = if let Some((vlag_src, beta_src)) = precomputed {
@@ -150,31 +152,22 @@ pub(crate) fn updateh(
         }
     }
 
-    // PRIMA update.f90 L148: BMAT = BMAT + OUTPROD(V1, VLAG) + OUTPROD(V2, HCOL).
-    // Two separate loops to preserve Fortran's left-to-right FP order:
-    // first add OUTPROD(V1, VLAG), then add OUTPROD(V2, HCOL).
-    // Column-slice form: same i-ascending per-column adds, no per-element
-    // index arithmetic or bounds checks; the lanes are independent.
+    // PRIMA update.f90 L148: BMAT = BMAT + OUTPROD(V1, VLAG) + OUTPROD(V2, HCOL). The array sum
+    // groups left-to-right per element, (BMAT + V1*VLAG) + V2*HCOL — keep that grouping
+    // (mirrors rescue.rs::updateh_rsc). Column-slice form: no per-element index arithmetic or
+    // bounds checks; the lanes are independent.
     for j in 0..(npt + n) {
-        let vj = vlag[j];
+        let (vj, hj) = (vlag[j], hcol[j]);
         let bj = &mut bmat.col_mut(j)[..n];
-        let v1 = &v1[..n];
+        let (v1, v2) = (&v1[..n], &v2[..n]);
         for i in 0..n {
-            bj[i] += v1[i] * vj;
-        }
-    }
-    for j in 0..(npt + n) {
-        let hj = hcol[j];
-        let bj = &mut bmat.col_mut(j)[..n];
-        let v2 = &v2[..n];
-        for i in 0..n {
-            bj[i] += v2[i] * hj;
+            bj[i] = (bj[i] + v1[i] * vj) + v2[i] * hj;
         }
     }
 
     // PRIMA update.f90 L151: SYMMETRIZE(BMAT(:, NPT+1:NPT+N)) — in place on the trailing n x n
     // section: copy the lower triangle to the upper in linalg::symmetrize's exact assignment
-    // order (M2 §4.3: the section-copy temporary is dropped; pure copies, FP-identical).
+    // order (the section-copy temporary is dropped; pure copies, FP-identical).
     // Mirrored by rescue.rs::updateh_rsc — change together.
     for j in 0..n {
         for i in 0..j {
@@ -258,7 +251,7 @@ pub(crate) fn updatexf(
 }
 
 /// PRIMA update.f90 L278 `updateq`: update GOPT, HQ, PQ when XPT(:, KNEW) changes.
-#[expect(clippy::too_many_arguments)] // out-params mirror the Fortran intent (rust.md §5)
+#[expect(clippy::too_many_arguments)] // out-params mirror the Fortran intent
 pub(crate) fn updateq(
     knew: Option<usize>,
     ximproved: bool,
@@ -335,9 +328,9 @@ pub(crate) fn updateq(
 
 /// PRIMA update.f90 L381 `tryqalt`: test whether to replace Q with the least Frobenius norm
 /// interpolant; replace (gopt ← galt, pq ← pqalt, hq ← 0, itest ← 0) when `itest` reaches 3.
-#[expect(clippy::too_many_arguments)] // out-params mirror the Fortran intent (rust.md §5)
-#[expect(clippy::similar_names)] // xopt/xpt and pqalt/pgalt are PRIMA identifiers (rust.md §5)
-#[expect(clippy::needless_range_loop)] // explicit indexed loops mirror PRIMA (rust.md §5)
+#[expect(clippy::too_many_arguments)] // out-params mirror the Fortran intent
+#[expect(clippy::similar_names)] // xopt/xpt and pqalt/pgalt are PRIMA identifiers
+#[expect(clippy::needless_range_loop)] // explicit indexed loops mirror PRIMA
 pub(crate) fn tryqalt(
     bmat: &Mat,
     fval: &[f64],
@@ -355,6 +348,13 @@ pub(crate) fn tryqalt(
 ) {
     let n = gopt.len();
     let npt = pq.len();
+
+    // PRIMA update.f90 L476-486 with RATIO > TENTH: ITEST = 0, so the ITEST >= 3 replacement
+    // cannot fire and PQALT/GALT/PGALT would be computed and dropped — skip them.
+    if ratio > 0.1 {
+        *itest = 0;
+        return;
+    }
 
     let UpdateWs {
         pgopt,
@@ -422,10 +422,10 @@ pub(crate) fn tryqalt(
 
     // PRIMA update.f90 L476: TENTH = 0.1, TEN = 10.0 literals.
     // PRIMA update.f90 L476: if (ratio > TENTH .or. inprod(pgopt) < TEN * inprod(pgalt)) then
-    //   itest = 0  else  itest += 1.
+    //   itest = 0  else  itest += 1. The RATIO > TENTH half is the early return at the top.
     let pgopt_sq = inprod(pgopt, pgopt);
     let pgalt_sq = inprod(pgalt, pgalt);
-    if ratio > 0.1 || pgopt_sq < 10.0 * pgalt_sq {
+    if pgopt_sq < 10.0 * pgalt_sq {
         *itest = 0;
     } else {
         *itest += 1;
@@ -444,14 +444,12 @@ pub(crate) fn tryqalt(
 mod tests {
     use super::*;
     use crate::mat::Mat;
-    use crate::test_support::{self, DiffStats};
+    use crate::test_support;
 
     #[test]
-    #[expect(clippy::similar_names)] // states/stats are conventional diff-test locals
     fn updateh_matches_prima_on_every_captured_state() {
         let states = test_support::load_states("updateh");
         assert!(!states.is_empty());
-        let mut stats = DiffStats::default();
         for st in &states {
             let (e, x) = (&st.entry, &st.exit);
             let knew = match e.usize("knew") {
@@ -467,18 +465,15 @@ mod tests {
             // (oracle/README.md, Instrumentation).
             let mut ws = UpdateWs::new(xpt.nrows(), xpt.ncols()).unwrap();
             let _info = updateh(knew, kopt, &d, &xpt, &mut bmat, &mut zmat, &mut ws, None);
-            stats.mat("bmat", &bmat, &x.mat("bmat"));
-            stats.mat("zmat", &zmat, &x.mat("zmat"));
+            test_support::assert_mat_bits("bmat", &bmat, &x.mat("bmat"));
+            test_support::assert_mat_bits("zmat", &zmat, &x.mat("zmat"));
         }
-        stats.report("updateh");
     }
 
     #[test]
-    #[expect(clippy::similar_names)] // states/stats are conventional diff-test locals
     fn updatexf_matches_prima_on_every_captured_state() {
         let states = test_support::load_states("updatexf");
         assert!(!states.is_empty());
-        let mut stats = DiffStats::default();
         for st in &states {
             let (e, x) = (&st.entry, &st.exit);
             let knew = match e.usize("knew") {
@@ -493,18 +488,15 @@ mod tests {
             let mut xpt = e.mat("xpt");
             updatexf(knew, ximproved, f, &xnew, &mut kopt, &mut fval, &mut xpt);
             assert_eq!(kopt + 1, x.usize("kopt"), "{}: kopt", st.problem);
-            stats.slice("fval", &fval, &x.vec("fval"));
-            stats.mat("xpt", &xpt, &x.mat("xpt"));
+            test_support::assert_slice_bits("fval", &fval, &x.vec("fval"));
+            test_support::assert_mat_bits("xpt", &xpt, &x.mat("xpt"));
         }
-        stats.report("updatexf");
     }
 
     #[test]
-    #[expect(clippy::similar_names)] // states/stats are conventional diff-test locals
     fn updateq_matches_prima_on_every_captured_state() {
         let states = test_support::load_states("updateq");
         assert!(!states.is_empty());
-        let mut stats = DiffStats::default();
         for st in &states {
             let (e, x) = (&st.entry, &st.exit);
             let knew = match e.usize("knew") {
@@ -527,19 +519,17 @@ mod tests {
                 knew, ximproved, &bmat, &d, moderr, &xdrop, &xosav, &xpt, &zmat, &mut gopt,
                 &mut hq, &mut pq, &mut ws,
             );
-            stats.slice("gopt", &gopt, &x.vec("gopt"));
-            stats.mat("hq", &hq, &x.mat("hq"));
-            stats.slice("pq", &pq, &x.vec("pq"));
+            test_support::assert_slice_bits("gopt", &gopt, &x.vec("gopt"));
+            test_support::assert_mat_bits("hq", &hq, &x.mat("hq"));
+            test_support::assert_slice_bits("pq", &pq, &x.vec("pq"));
         }
-        stats.report("updateq");
     }
 
     #[test]
-    #[expect(clippy::similar_names)] // states/stats and xopt/xpt are PRIMA identifiers (rust.md §5)
+    #[expect(clippy::similar_names)] // xopt/xpt are PRIMA identifiers
     fn tryqalt_matches_prima_on_every_captured_state() {
         let states = test_support::load_states("tryqalt");
         assert!(!states.is_empty());
-        let mut stats = DiffStats::default();
         for st in &states {
             let (e, x) = (&st.entry, &st.exit);
             let bmat = e.mat("bmat");
@@ -565,11 +555,10 @@ mod tests {
                 "{}: itest",
                 st.problem
             );
-            stats.slice("gopt", &gopt, &x.vec("gopt"));
-            stats.mat("hq", &hq, &x.mat("hq"));
-            stats.slice("pq", &pq, &x.vec("pq"));
+            test_support::assert_slice_bits("gopt", &gopt, &x.vec("gopt"));
+            test_support::assert_mat_bits("hq", &hq, &x.mat("hq"));
+            test_support::assert_slice_bits("pq", &pq, &x.vec("pq"));
         }
-        stats.report("tryqalt");
     }
 
     // ---------------------------------------------------------------------------
@@ -638,7 +627,7 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::similar_names)] // xopt/xpt are PRIMA identifiers (rust.md §5)
+    #[expect(clippy::similar_names)] // xopt/xpt are PRIMA identifiers
     fn tryqalt_replaces_the_model_on_the_third_consecutive_failure() {
         // Bound-free toy where pgopt is huge vs pgalt (zmat = 0 => pqalt = 0, galt from bmat):
         // ratio <= 0.1 and the gradient test fails => itest increments; at 3 the model resets.
@@ -665,12 +654,13 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::similar_names)] // xopt/xpt, sl/su are PRIMA identifiers (rust.md §5)
+    #[expect(clippy::similar_names)] // xopt/xpt, sl/su are PRIMA identifiers
     fn tryqalt_resets_itest_when_only_the_ratio_is_good() {
         // ratio > 0.1 is the SOLE reset trigger here: zero bmat/zmat/fval => galt = pgalt = 0, so the
-        // second arm (pgopt_sq < 10*pgalt_sq) is false. A `>`->`==` mutation on `ratio > 0.1` (L380)
-        // misses 0.5 and would increment itest (1 -> 2) instead of resetting it to 0. The existing
-        // tryqalt test only drives the increment path (ratio = 0), never this reset arm.
+        // second arm (pgopt_sq < 10*pgalt_sq) is false. A `>`->`==` mutation on `ratio > 0.1` in
+        // `tryqalt` misses 0.5 and would increment itest (1 -> 2) instead of resetting it to 0.
+        // The existing tryqalt test only drives the increment path (ratio = 0), never this reset
+        // arm.
         let (n, npt) = (1, 4);
         let bmat = Mat::zeros(n, npt + n);
         let zmat = Mat::zeros(npt, npt - n - 1);

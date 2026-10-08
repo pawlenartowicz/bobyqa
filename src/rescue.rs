@@ -1,18 +1,19 @@
 //! `rescue.f90` (PRIMA): the geometry-restoring RESCUE procedure of Section 5 of the BOBYQA
-//! paper, plus its private helper `updateh_rsc` — design §5.
+//! paper, plus its private helper `updateh_rsc`.
 //!
 //! Index convention: point/variable indices 0-based (`kopt`, `kpt`, `korig`, `kprov`), EXCEPT the
 //! `ip`/`iq` values decoded from `PTSID`: those stay PRIMA's 1-based variable indices with 0 as
 //! the "no direction" sentinel, because PTSID's arithmetic encoding
 //! (`ptsid = ip + iq/(n+1) + sfrac`) bakes them in — translate with `- 1` only when indexing
 //! (`ptsaux`, `gopt`, `hq`, `xpt` rows). History (`xhist`/`fhist`) and `iprint`/`solver`/`fmsg`/
-//! `savehist` are omitted (SPEC §7.6); info codes are `consts.rs` values.
+//! `savehist` are omitted because the crate does no I/O (a caller records any trace in its own
+//! closure); info codes are `consts.rs` values.
 use crate::consts::{DAMAGING_ROUNDING, INFO_DFT, MAXFUN_REACHED};
 use crate::linalg::{inprod, matprod12_into, matprod21_into, planerot};
 use crate::mat::Mat;
 use crate::math;
 use crate::powalg::{hess_mul_into, setij_into};
-use crate::util::{checkexit, evaluate, try_capacity, try_vec, xinbd_into};
+use crate::util::{Reserved, checkexit, evaluate, try_capacity, try_vec, xinbd_into};
 use alloc::collections::TryReserveError;
 #[cfg(test)]
 use alloc::vec;
@@ -30,44 +31,44 @@ struct UpdatehRscWs {
 }
 
 /// Reused scratch for `rescue` — PRIMA's per-call locals, hoisted to the solver workspace
-/// (rust.md §4). Lifetime and contents per call are identical to the Fortran locals; only the
-/// allocation site moves: every field is re-initialized at the original allocation site, per
-/// call and per loop iteration where the original was in-loop. Sized for the worst case even
-/// though rescue rarely runs — zero-alloc means zero, not "zero on the happy path" (M2 §4.1).
+/// so that `minimize` performs no heap allocation after `Bobyqa::new`. Lifetime and contents per
+/// call are identical to the Fortran locals; only the allocation site moves: every field is
+/// re-initialized at the original allocation site, per call and per loop iteration where the
+/// original was in-loop. Sized for the worst case even
+/// though rescue rarely runs — zero-alloc means zero, not "zero on the happy path".
 /// Field → Fortran-local map: most fields carry their PRIMA names (`xopt`/`ptsaux1`/`ptsaux2`
 /// = the two PTSAUX rows/`ptsid`/`score`/`vlag`/`wmv`/`den`/`xxpt`/`pqinc`); `v` is the L251
 /// HQ-update vector, `ij` the SETIJ pairs, `wmv_z`/`z_wmv_z`/`bmat_wmv`/`z_zrow` the MATPROD
 /// temps, `t` the L388 BSUM accumulator, `xnew` the refill point, `x`/`xmod` the evaluation
 /// point and evaluate's MODERATEX copy, `zrow` the ZMAT(KPT, :) row-extraction temp,
-/// `xpt_col` the XPT(:, KPT)/XPT(:, KOPT) column copies, `shift` the L578 `HESS_MUL` result,
-/// `dxpt` `hess_mul` scratch, `rsc` `updateh_rsc`'s locals.
+/// `shift` the L578 `HESS_MUL` result, `dxpt` `hess_mul` scratch, `rsc` `updateh_rsc`'s
+/// locals.
 #[derive(Debug, Clone)]
 pub(crate) struct RescueWs {
-    xopt: Vec<f64>,          // n
-    v: Vec<f64>,             // n
-    ptsaux1: Vec<f64>,       // n
-    ptsaux2: Vec<f64>,       // n
-    ptsid: Vec<f64>,         // npt
-    ij: Vec<(usize, usize)>, // capacity max(0, npt - 2n - 1)
-    score: Vec<f64>,         // npt
-    vlag: Vec<f64>,          // npt + n
-    wmv: Vec<f64>,           // npt + n
-    wmv_z: Vec<f64>,         // npt - n - 1
-    z_wmv_z: Vec<f64>,       // npt
-    bmat_wmv: Vec<f64>,      // n
-    t: Vec<f64>,             // n
-    den: Vec<f64>,           // npt
-    xnew: Vec<f64>,          // n
-    x: Vec<f64>,             // n
-    xmod: Vec<f64>,          // n
-    xxpt: Vec<f64>,          // npt
-    pq_xxpt: Vec<f64>,       // npt
-    zrow: Vec<f64>,          // npt - n - 1
-    z_zrow: Vec<f64>,        // npt
-    pqinc: Vec<f64>,         // npt
-    xpt_col: Vec<f64>,       // n
-    shift: Vec<f64>,         // n
-    dxpt: Vec<f64>,          // npt
+    xopt: Vec<f64>,               // n
+    v: Vec<f64>,                  // n
+    ptsaux1: Vec<f64>,            // n
+    ptsaux2: Vec<f64>,            // n
+    ptsid: Vec<f64>,              // npt
+    ij: Reserved<(usize, usize)>, // capacity max(0, npt - 2n - 1)
+    score: Vec<f64>,              // npt
+    vlag: Vec<f64>,               // npt + n
+    wmv: Vec<f64>,                // npt + n
+    wmv_z: Vec<f64>,              // npt - n - 1
+    z_wmv_z: Vec<f64>,            // npt
+    bmat_wmv: Vec<f64>,           // n
+    t: Vec<f64>,                  // n
+    den: Vec<f64>,                // npt
+    xnew: Vec<f64>,               // n
+    x: Vec<f64>,                  // n
+    xmod: Vec<f64>,               // n
+    xxpt: Vec<f64>,               // npt
+    pq_xxpt: Vec<f64>,            // npt
+    zrow: Vec<f64>,               // npt - n - 1
+    z_zrow: Vec<f64>,             // npt
+    pqinc: Vec<f64>,              // npt
+    shift: Vec<f64>,              // n
+    dxpt: Vec<f64>,               // npt
     rsc: UpdatehRscWs,
 }
 
@@ -96,7 +97,6 @@ impl RescueWs {
             zrow: try_vec(0.0, npt - n - 1)?,
             z_zrow: try_vec(0.0, npt)?,
             pqinc: try_vec(0.0, npt)?,
-            xpt_col: try_vec(0.0, n)?,
             shift: try_vec(0.0, n)?,
             dxpt: try_vec(0.0, npt)?,
             rsc: UpdatehRscWs {
@@ -111,9 +111,9 @@ impl RescueWs {
 
 /// PRIMA rescue.f90 L32 `rescue`: replace a few interpolation points by new ones to improve the
 /// geometry of the set and the conditioning of the interpolation system. Returns `info`.
-#[expect(clippy::too_many_arguments)] // out-params mirror the Fortran intent (rust.md §5)
-#[expect(clippy::too_many_lines)] // one Fortran subroutine body, transcribed in place (rust.md §5)
-#[expect(clippy::needless_range_loop)] // explicit indexed loops mirror PRIMA (rust.md §5)
+#[expect(clippy::too_many_arguments)] // out-params mirror the Fortran intent
+#[expect(clippy::too_many_lines)] // one Fortran subroutine body, transcribed in place
+#[expect(clippy::needless_range_loop)] // explicit indexed loops mirror PRIMA
 #[expect(clippy::cast_possible_truncation)] // floor(ptsid) as usize: value is a small exact integer — module header
 #[expect(clippy::cast_sign_loss)] // floor(ptsid) as usize: ptsid >= 0 at every decode site — module header
 pub(crate) fn rescue<F: FnMut(&[f64]) -> f64>(
@@ -163,7 +163,6 @@ pub(crate) fn rescue<F: FnMut(&[f64]) -> f64>(
         zrow,
         z_zrow,
         pqinc,
-        xpt_col,
         shift,
         dxpt,
         rsc,
@@ -242,7 +241,7 @@ pub(crate) fn rescue<F: FnMut(&[f64]) -> f64>(
         // PRIMA L269: ptsid(k+1) = real(k) + sfrac (1-based k = k+1 here).
         ptsid[k + 1] = (k + 1) as f64 + sfrac;
         // PRIMA L270: 1-based `k <= npt-n-1`; kept as `k+1 <= ...` to mirror the Fortran condition.
-        #[expect(clippy::int_plus_one)] // faithful to PRIMA's 1-based bound (rust.md §5)
+        #[expect(clippy::int_plus_one)] // faithful to PRIMA's 1-based bound
         if k + 1 <= npt - n - 1 {
             // PRIMA L271: ptsid(k+n+1) = real(k)/real(n+1) + sfrac.
             ptsid[k + n + 1] = (k + 1) as f64 / (n as f64 + 1.0) + sfrac;
@@ -264,8 +263,8 @@ pub(crate) fn rescue<F: FnMut(&[f64]) -> f64>(
 
     // PRIMA L287-295: set any remaining identifiers with their nonzero elements of ZMAT.
     // setij returns 0-based pairs; PTSID's arithmetic encoding needs PRIMA's 1-based ip/iq with 0
-    // as the "no direction" sentinel, so add 1. (Mirrors inith's identical pattern, initialize.rs
-    // L300-306: Fortran ZMAT rows ip+1/iq+1 1-based == ip/iq 0-based.)
+    // as the "no direction" sentinel, so add 1. (Mirrors the identical pattern in `inith` in
+    // initialize.rs: Fortran ZMAT rows ip+1/iq+1 1-based == ip/iq 0-based.)
     setij_into(n, npt, ij);
     for k in (2 * n + 1)..npt {
         let (i0, j0) = ij[k - (2 * n + 1)];
@@ -497,9 +496,7 @@ pub(crate) fn rescue<F: FnMut(&[f64]) -> f64>(
             }
 
             // PRIMA L469-470: absorb PQ(KPT)*XPT(:, KPT)*XPT(:, KPT)^T into HQ; PQ(KPT) = 0.
-            // Copy the column first — xpt is borrowed mutably later in the iteration.
-            xpt_col.copy_from_slice(xpt.col(kpt));
-            crate::linalg::r1update(hq, pq[kpt], xpt_col);
+            crate::linalg::r1update(hq, pq[kpt], xpt.col(kpt));
             pq[kpt] = 0.0;
 
             // PRIMA L472-473: decode 1-based ip/iq.
@@ -541,7 +538,7 @@ pub(crate) fn rescue<F: FnMut(&[f64]) -> f64>(
             xinbd_into(xbase, xpt.col(kpt), xl, xu, sl, su, x);
             let f = evaluate(calfun, x, xmod);
             *nf += 1;
-            // PRIMA L515-517: fmsg/savehist omitted (SPEC §7.6).
+            // PRIMA L515-517: fmsg/savehist omitted (the crate does no I/O).
 
             // PRIMA L520-523: update FVAL and KOPT.
             fval[kpt] = f;
@@ -637,8 +634,7 @@ pub(crate) fn rescue<F: FnMut(&[f64]) -> f64>(
 
     // PRIMA L577-579: update GOPT if KOPT changed.
     if *kopt != kbase {
-        xpt_col.copy_from_slice(xpt.col(*kopt));
-        hess_mul_into(xpt_col, xpt, pq, Some(&*hq), dxpt, shift);
+        hess_mul_into(xpt.col(*kopt), xpt, pq, Some(&*hq), dxpt, shift);
         for i in 0..n {
             gopt[i] += shift[i];
         }
@@ -774,14 +770,12 @@ fn updateh_rsc(
 mod tests {
     use super::*;
     use crate::mat::Mat;
-    use crate::test_support::{self, DiffStats};
+    use crate::test_support;
 
     #[test]
-    #[expect(clippy::similar_names)] // states/stats are conventional diff-test locals
     fn rescue_matches_prima_on_every_captured_state() {
         let states = test_support::load_states("rescue");
         assert!(!states.is_empty());
-        let mut stats = DiffStats::default();
         for st in &states {
             let (e, x) = (&st.entry, &st.exit);
             let f = test_support::objective(&st.problem);
@@ -816,18 +810,17 @@ mod tests {
             assert_eq!(kopt + 1, x.usize("kopt"), "{}: kopt", st.problem);
             assert_eq!(nf, x.usize("nf"), "{}: nf", st.problem);
             assert_eq!(i64::from(info), x.i64("info"), "{}: info", st.problem);
-            stats.slice("fval", &fval, &x.vec("fval"));
-            stats.slice("gopt", &gopt, &x.vec("gopt"));
-            stats.mat("hq", &hq, &x.mat("hq"));
-            stats.slice("pq", &pq, &x.vec("pq"));
-            stats.slice("sl", &sl, &x.vec("sl"));
-            stats.slice("su", &su, &x.vec("su"));
-            stats.slice("xbase", &xbase, &x.vec("xbase"));
-            stats.mat("xpt", &xpt, &x.mat("xpt"));
-            stats.mat("bmat", &bmat, &x.mat("bmat"));
-            stats.mat("zmat", &zmat, &x.mat("zmat"));
+            test_support::assert_slice_bits("fval", &fval, &x.vec("fval"));
+            test_support::assert_slice_bits("gopt", &gopt, &x.vec("gopt"));
+            test_support::assert_mat_bits("hq", &hq, &x.mat("hq"));
+            test_support::assert_slice_bits("pq", &pq, &x.vec("pq"));
+            test_support::assert_slice_bits("sl", &sl, &x.vec("sl"));
+            test_support::assert_slice_bits("su", &su, &x.vec("su"));
+            test_support::assert_slice_bits("xbase", &xbase, &x.vec("xbase"));
+            test_support::assert_mat_bits("xpt", &xpt, &x.mat("xpt"));
+            test_support::assert_mat_bits("bmat", &bmat, &x.mat("bmat"));
+            test_support::assert_mat_bits("zmat", &zmat, &x.mat("zmat"));
         }
-        stats.report("rescue");
     }
 
     #[test]

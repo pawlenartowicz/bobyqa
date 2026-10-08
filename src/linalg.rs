@@ -6,11 +6,9 @@
 //! Call-site convention: Fortran *array sections* at call sites (`diag(xpt(:, 2:n+1))`,
 //! `bmat(:, 1:npt)`) have no Rust equivalent — the call site writes the explicit indexed loop
 //! with a citation; the helpers here take whole `Mat`s/slices.
-use crate::consts::{REALMAX, SYMTOL};
+use crate::consts::{EPS, REALMAX, REALMIN};
 use crate::mat::Mat;
 use crate::math;
-use alloc::vec;
-use alloc::vec::Vec;
 
 /// PRIMA linalg.f90 L465 `inprod`: z = x^T y, accumulated in element order.
 pub(crate) fn inprod(x: &[f64], y: &[f64]) -> f64 {
@@ -43,7 +41,7 @@ pub(crate) fn matprod12_into(x: &[f64], y: &Mat, z: &mut [f64]) {
 /// PRIMA linalg.f90 L377 `matprod21`: matrix x times column-vector y; z accumulates x(:, j)*y(j)
 /// column by column (NOT row-by-row dot products — the loop order is part of the contract).
 /// Zeroes `z` (length `x.nrows()`) first, like the fresh allocation it replaces.
-#[expect(clippy::needless_range_loop)] // explicit indexed loops mirror PRIMA (rust.md §5)
+#[expect(clippy::needless_range_loop)] // explicit indexed loops mirror PRIMA
 pub(crate) fn matprod21_into(x: &Mat, y: &[f64], z: &mut [f64]) {
     debug_assert_eq!(x.ncols(), y.len());
     debug_assert_eq!(z.len(), x.nrows());
@@ -92,7 +90,7 @@ pub(crate) fn matprod22_into(x: &Mat, y: &Mat, z: &mut Mat) {
 }
 
 /// PRIMA linalg.f90 L502 `outprod`: z = x*y^T, filled column by column (full overwrite).
-#[expect(clippy::needless_range_loop)] // explicit indexed loops mirror PRIMA (rust.md §5)
+#[expect(clippy::needless_range_loop)] // explicit indexed loops mirror PRIMA
 pub(crate) fn outprod_into(x: &[f64], y: &[f64], z: &mut Mat) {
     debug_assert_eq!((z.nrows(), z.ncols()), (x.len(), y.len()));
     for i in 0..y.len() {
@@ -106,7 +104,7 @@ pub(crate) fn outprod_into(x: &[f64], y: &[f64], z: &mut Mat) {
 }
 
 /// `radix^((MIN_EXP - 1).max(1 - MAX_EXP))` = `2^-1022`, exactly `f64::MIN_POSITIVE` — the
-/// `norm` rescue's `scalmin`, as a const so no math backend needs a `powi` (`no_std` spec §6).
+/// `norm` rescue's `scalmin`, as a const so no math backend needs a `powi`.
 const SCALMIN: f64 = f64::MIN_POSITIVE;
 /// `radix^((MAX_EXP - 1).min(1 - MIN_EXP))` = `2^1022` — the `norm` rescue's `scalmax`.
 const SCALMAX: f64 = f64::from_bits(0x7FD0_0000_0000_0000);
@@ -142,7 +140,7 @@ pub(crate) fn norm(x: &[f64]) -> f64 {
             // Rust's MIN_EXP/MAX_EXP; PRIMA's radix**(minexponent-1)/radix**(maxexponent-1)
             // formulas (with their no-op-for-f64 min/max guards) resolve to the compile-time
             // constants 2^-1022 and 2^1022 — both exact powers of two, written as consts so no
-            // math backend needs a `powi` (no_std spec §5 task 1; the unit test
+            // math backend needs a `powi` (the unit test
             // `scal_consts_match_the_original_powi_expressions` pins them to the original powi
             // expressions).
             let scaling = SCALMAX.min(SCALMIN.max(maxabs));
@@ -157,66 +155,14 @@ pub(crate) fn norm(x: &[f64]) -> f64 {
     }
 }
 
-/// PRIMA linalg.f90 L1129 `diag`, k = 0 only: the main diagonal.
-#[allow(dead_code)] // no caller: call sites in initialize.rs use indexed loops per the call-site convention
-pub(crate) fn diag(a: &Mat) -> Vec<f64> {
-    let dlen = a.nrows().min(a.ncols());
-    let mut d = vec![0.0; dlen];
-    for i in 0..dlen {
-        d[i] = a[[i, i]];
-    }
-    d
-}
-
-/// PRIMA linalg.f90 L1798 `issymmetric`, tol = `consts::SYMTOL` (debug checks).
-#[allow(dead_code)] // debug helper with no caller outside the linalg tests
-pub(crate) fn issymmetric(a: &Mat) -> bool {
-    if a.nrows() != a.ncols() {
-        return false;
-    }
-    // PRIMA: the check runs only when SYMTOL_DFT < 0.9*REALMAX — always true for our SYMTOL.
-    let mut maxabs = 0.0_f64;
-    for j in 0..a.ncols() {
-        for &v in a.col(j) {
-            maxabs = maxabs.max(math::abs(v));
-        }
-    }
-    let tol = SYMTOL * maxabs.max(1.0);
-    for j in 0..a.ncols() {
-        for i in 0..a.nrows() {
-            // PRIMA: .not. any(|A - A^T| > tol) — NaN compares false, exactly as in Fortran.
-            if math::abs(a[[i, j]] - a[[j, i]]) > tol {
-                return false;
-            }
-            // PRIMA: all(is_nan(A) .eqv. is_nan(A^T)).
-            if a[[i, j]].is_nan() != a[[j, i]].is_nan() {
-                return false;
-            }
-        }
-    }
-    true
-}
-
-/// PRIMA linalg.f90 L2224 `trueloc` — returns **0-based** positions of `true`, ascending.
-#[allow(dead_code)] // no caller: call sites in geometry/rescue use inline indexed loops per the call-site convention
-pub(crate) fn trueloc(x: &[bool]) -> Vec<usize> {
-    let mut loc = Vec::with_capacity(x.len());
-    for (i, &v) in x.iter().enumerate() {
-        if v {
-            loc.push(i);
-        }
-    }
-    loc
-}
-
 /// PRIMA linalg.f90 L1568 `planerot`: a 2x2 Givens matrix G with G*x = [r; 0], all 0/NaN/inf
 /// edge cases transcribed; returns `[[c, s], [-s, c]]` row-major.
 ///
 /// Fortran `sign(a, b)` (|a| with b's sign, IEEE sign-bit semantics in gfortran) transcribes to
 /// `a.copysign(b)` for non-negative `a`.
-#[expect(clippy::many_single_char_names)] // c/s/t/u/r are PRIMA's identifiers (rust.md §5)
+#[expect(clippy::many_single_char_names)] // c/s/t/u/r are PRIMA's identifiers
 pub(crate) fn planerot(x: [f64; 2]) -> [[f64; 2]; 2] {
-    let eps = f64::EPSILON;
+    let eps = EPS;
     let (c, s);
     if x[0].is_nan() || x[1].is_nan() {
         // PRIMA: MATLAB would return NaN(2,2); PRIMA keeps G orthogonal.
@@ -239,7 +185,7 @@ pub(crate) fn planerot(x: [f64; 2]) -> [[f64; 2]; 2] {
         // PRIMA linalg.f90 L1635-1639: the normal case — a stable & continuous Givens rotation
         // (Bindel, Demmel, Kahan & Marques, 2002). lo/hi are the L1639 guard thresholds bracketing
         // the magnitude range where the direct r = norm(x) form cannot over/underflow.
-        let lo = math::sqrt(f64::MIN_POSITIVE);
+        let lo = math::sqrt(REALMIN);
         let hi = math::sqrt(REALMAX / 2.1);
         if x.iter().all(|&v| math::abs(v) > lo && math::abs(v) < hi) {
             // PRIMA: the direct calculation works better when no over/underflow is possible.
@@ -347,17 +293,6 @@ mod tests {
     }
 
     #[test]
-    fn diag_extracts_the_main_diagonal() {
-        let a = Mat::from_col_major(2, 2, vec![1.0, 2.0, 3.0, 4.0]);
-        assert_eq!(diag(&a), vec![1.0, 4.0]);
-    }
-
-    #[test]
-    fn trueloc_returns_zero_based_positions() {
-        assert_eq!(trueloc(&[false, true, false, true]), vec![1, 3]);
-    }
-
-    #[test]
     fn planerot_zeroes_the_second_component() {
         let g = planerot([3.0, 4.0]);
         let y2 = g[1][0] * 3.0 + g[1][1] * 4.0;
@@ -421,7 +356,7 @@ mod tests {
 
     #[test]
     fn scal_consts_match_the_original_powi_expressions() {
-        // no_std spec §6: the consts replace std-only `powi` calls; pin them bit-for-bit to the
+        // The consts replace std-only `powi` calls; pin them bit-for-bit to the
         // original PRIMA-transcribed expressions (tests always build with std).
         #[expect(clippy::unnecessary_min_or_max)]
         let scalmin = f64::from(f64::RADIX).powi((f64::MIN_EXP - 1).max(1 - f64::MAX_EXP));
@@ -449,15 +384,5 @@ mod tests {
         let mut b = Mat::zeros(2, 2);
         r2update(&mut b, 1.0, &[1.0, 1.0], &[1.0, 2.0]);
         assert_eq!(b.data(), &[2.0, 3.0, 3.0, 4.0]);
-    }
-
-    #[test]
-    fn issymmetric_and_symmetrize_agree() {
-        let mut a = Mat::from_col_major(2, 2, vec![1.0, 2.0, 2.0 + 1.0e-16, 4.0]);
-        assert!(issymmetric(&a));
-        a[[0, 1]] = 9.0;
-        assert!(!issymmetric(&a));
-        symmetrize(&mut a);
-        assert!(issymmetric(&a));
     }
 }

@@ -1,4 +1,4 @@
-//! Safe-checks spec S3.1: reuse after an objective panic.
+//! Reuse after an objective panic.
 //!
 //! `Bobyqa::minimize` documents that it re-initializes whatever it reads, so a solver whose
 //! objective unwound mid-solve must afterwards reproduce a clean solver's trajectory EXACTLY

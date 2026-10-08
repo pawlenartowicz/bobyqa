@@ -1,6 +1,6 @@
 [package]
 name = "bobyqa"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2024"
 rust-version = "1.85"
 authors = ["Paweł Lenartowicz <pawellenartowicz@europe.com>"]
@@ -12,8 +12,10 @@ license = "MIT OR Apache-2.0"
 keywords = ["optimization", "bobyqa", "derivative-free", "minimization", "powell"]
 categories = ["mathematics", "science", "algorithms"]
 # The parity battery and its ~5 MB of frozen PRIMA trajectory/state dumps are a CI-only asset —
-# they live in git for CI but are not shipped to downstream users.
-exclude = ["tests/"]
+# they live in git for CI but are not shipped to downstream users. `oracle/` is the harness
+# that regenerates them from PRIMA; the same rule applies. `examples/` holds a measurement probe
+# and is not shipped either.
+exclude = ["tests/", "oracle/", "examples/"]
 
 # Zero runtime dependencies by default: the golden parser is hand-rolled, and the bit-exact
 # parity discipline never needed `approx`. The one optional dependency, `libm`, is pulled in

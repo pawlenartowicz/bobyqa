@@ -3,7 +3,7 @@
 //! Index convention: all indices 0-based (`kref`, `k`, the `setij` pairs).
 //!
 //! The `idz` parameter (NEWUOA machinery) is `optional` in Fortran and **never passed by
-//! BOBYQA** (call-site audit 2026-06-04: `calbeta(kopt, bmat, d, xpt, zmat)` etc.) — this port
+//! BOBYQA** (its call sites read `calbeta(kopt, bmat, d, xpt, zmat)` etc.) — this port
 //! is the `idz = 1` specialization with the parameter omitted; each site where the Fortran
 //! branches on `idz` carries a citation note.
 use crate::linalg::{inprod, matprod12_into, matprod21_into};
@@ -14,9 +14,9 @@ use alloc::collections::TryReserveError;
 use alloc::vec;
 use alloc::vec::Vec;
 
-/// Dev-only `calvlag_noadd` invocation counter (Layer-0 spec §9 F0a). Compiled in **only** under
-/// the `count-kernels` feature; the default build has no global state (SPEC §1 aim 4 —
-/// determinism). `calvlag_noadd` is the single ≈15·n² H·w chokepoint that every kernel consumer
+/// Dev-only `calvlag_noadd` invocation counter (kernel-count instrumentation). Compiled in **only** under
+/// the `count-kernels` feature; the default build has no global state
+/// (determinism). `calvlag_noadd` is the single ≈15·n² H·w chokepoint that every kernel consumer
 /// (`calvlag_into` / `calbeta` / `calden_into` / `calvlag_and_den_into`) routes through, so this
 /// one counter measures the recompute multiplicity directly. Measurement instrumentation that
 /// never ships — the same justification as tests/alloc.rs's `GlobalAlloc` shim.
@@ -66,7 +66,7 @@ pub(crate) fn setij_into(n: usize, npt: usize, ij: &mut Vec<(usize, usize)>) {
 /// `sum_k PQ(k)*XPT(:, k)*XPT(:, k)^T`. `hq` **is** omitted at three BOBYQA call sites
 /// (update.f90 L360/L464, geometry.f90 L309) → `Option`, `None` ≡ Fortran "0 if absent".
 /// `dxpt` is npt-length scratch; the result lands in `y` (length n).
-#[expect(clippy::needless_range_loop)] // explicit indexed loops mirror PRIMA (rust.md §5)
+#[expect(clippy::needless_range_loop)] // explicit indexed loops mirror PRIMA
 pub(crate) fn hess_mul_into(
     x: &[f64],
     xpt: &Mat,
@@ -172,9 +172,9 @@ impl CalWs {
 
 /// PRIMA powalg.f90 L1685-1692 (the `calbeta` tail): BETA from a step `d`, its reference column
 /// `xref = xpt(:, kref)`, the `wcheck` weights, and VLAG computed **without** the `+1` at `kref`.
-/// Factored out of `calbeta_core` so `calden_into`/`calvlag_and_den_into` derive BETA from a
-/// single shared kernel result instead of recomputing VLAG (Layer-0 spec §3-§5). `vlag` is the
-/// no-`+1` H·w (length npt + n).
+/// Shared by `calbeta` and `calvlag_and_den_into` (and through it `calden_into`), so BETA comes
+/// from a single kernel result instead of a VLAG recompute. `vlag` is the no-`+1` H·w (length
+/// npt + n).
 fn beta_from_noadd_vlag(
     d: &[f64],
     xref: &[f64],
@@ -192,9 +192,9 @@ fn beta_from_noadd_vlag(
     dxref * dxref + dsq * (xrefsq + dxref + dxref + 0.5 * dsq) - dvlag - wvlag
 }
 
-/// The body shared by [`calvlag_into`] and [`calbeta`]: VLAG = H*w *without* the +1 at `kref`
-/// (the difference between the two PRIMA routines). Narrow slice params (not `&mut CalWs`) so
-/// [`calden_into`] can lend disjoint fields of one workspace to both nested calls.
+/// The body shared by [`calvlag_into`], [`calbeta`] and [`calvlag_and_den_into`]: VLAG = H*w
+/// *without* the +1 at `kref` (the difference between the two PRIMA routines). Narrow slice
+/// params (not `&mut CalWs`) so each caller can lend disjoint fields of one workspace.
 #[expect(clippy::too_many_arguments)] // scratch params mirror the hoisted Fortran locals
 fn calvlag_noadd(
     kref: usize,
@@ -259,30 +259,6 @@ pub(crate) fn calvlag_into(
     vlag[kref] += 1.0;
 }
 
-/// The [`calbeta`] body over narrow slices — see [`calvlag_noadd`] for why not `&mut CalWs`.
-#[expect(clippy::too_many_arguments)] // scratch params mirror the hoisted Fortran locals
-fn calbeta_core(
-    kref: usize,
-    bmat: &Mat,
-    d: &[f64],
-    xpt: &Mat,
-    zmat: &Mat,
-    wcheck: &mut [f64],
-    xrefxpt: &mut [f64],
-    xz: &mut [f64],
-    omega: &mut [f64],
-    wmv: &mut [f64],
-    vlag: &mut [f64],
-) -> f64 {
-    let n = xpt.nrows();
-    let npt = xpt.ncols();
-    let xref = xpt.col(kref); // PRIMA: xref = xpt(:, kref)
-    calvlag_noadd(
-        kref, bmat, d, xpt, zmat, wcheck, xrefxpt, xz, omega, wmv, vlag,
-    );
-    beta_from_noadd_vlag(d, xref, wcheck, vlag, n, npt)
-}
-
 /// PRIMA powalg.f90 L1599 `calbeta`: BETA for step `d` from XREF = XPT(:, kref) — see (4.12) and
 /// (4.26) of the NEWUOA paper. `kref` is 0-based. N.B. it recomputes VLAG *without* the +1 at
 /// `kref`, exactly as the Fortran does (the `vlag(kref) + ONE` line there is commented out).
@@ -294,6 +270,9 @@ pub(crate) fn calbeta(
     zmat: &Mat,
     cw: &mut CalWs,
 ) -> f64 {
+    let n = xpt.nrows();
+    let npt = xpt.ncols();
+    let xref = xpt.col(kref); // PRIMA: xref = xpt(:, kref)
     let CalWs {
         wcheck,
         xrefxpt,
@@ -303,9 +282,10 @@ pub(crate) fn calbeta(
         vlag_beta,
         ..
     } = cw;
-    calbeta_core(
+    calvlag_noadd(
         kref, bmat, d, xpt, zmat, wcheck, xrefxpt, xz, omega, wmv, vlag_beta,
-    )
+    );
+    beta_from_noadd_vlag(d, xref, wcheck, vlag_beta, n, npt)
 }
 
 /// PRIMA powalg.f90 L1721 `calden`: DEN(k) = SIGMA of (4.12) of the NEWUOA paper if XPT(:, k)
@@ -320,51 +300,18 @@ pub(crate) fn calden_into(
     cw: &mut CalWs,
     den: &mut [f64],
 ) {
-    let n = xpt.nrows();
-    let npt = xpt.ncols();
-    let xref = xpt.col(kref); // PRIMA: xref = xpt(:, kref)
-    let CalWs {
-        wcheck,
-        xrefxpt,
-        xz,
-        omega,
-        wmv,
-        vlag_den,
-        hdiag,
-        ..
-    } = cw;
-    // PRIMA: hdiag = -sum(zmat(:, 1:idz-1)**2, dim=2) + sum(zmat(:, idz:)**2, dim=2) —
-    // the negative part is empty for idz = 1. Column-outer interchange:
-    // contiguous ZMAT columns instead of stride-npt rows; every hdiag[k] still accumulates
-    // its z² terms in ascending j, so the sums are bit-identical to the row-outer form.
-    hdiag[..npt].fill(0.0);
-    for j in 0..zmat.ncols() {
-        let zj = &zmat.col(j)[..npt];
-        for k in 0..npt {
-            hdiag[k] += zj[k] * zj[k];
-        }
-    }
-    // Layer-0 spec §3-§5: PRIMA's calden calls calvlag AND calbeta, each recomputing the same
-    // ≈15·n² H·w kernel on identical inputs. Here the kernel runs ONCE (into vlag_den, no `+1`),
-    // BETA is derived from it, then the `+1` is applied for DEN — bit-identical to two calls
-    // (results from one kernel; the `+1` and the BETA read both consume the no-`+1` vector before
-    // it is mutated). Provenance: fuses calvlag_lfqint + calbeta.
-    calvlag_noadd(
-        kref, bmat, d, xpt, zmat, wcheck, xrefxpt, xz, omega, wmv, vlag_den,
-    );
-    let beta = beta_from_noadd_vlag(d, xref, wcheck, vlag_den, n, npt);
-    vlag_den[kref] += 1.0; // the calvlag `+1` at kref (read AFTER beta, which needs the no-+1 form)
-    // PRIMA: den = hdiag * beta + vlag(1:npt)**2.
-    for k in 0..npt {
-        den[k] = hdiag[k] * beta + vlag_den[k] * vlag_den[k];
-    }
+    // `Vec::new()` does not allocate, so lending the buffer out of `cw` keeps the warm path
+    // allocation-free.
+    let mut vlag_den = core::mem::take(&mut cw.vlag_den);
+    calvlag_and_den_into(kref, bmat, d, xpt, zmat, cw, &mut vlag_den, den);
+    cw.vlag_den = vlag_den;
 }
 
-/// Layer-0 spec §5 (Tier A): VLAG **and** DEN from one ≈15·n² H·w kernel call, for the `bobyqb`
+/// The fused VLAG/DEN kernel: VLAG **and** DEN from one ≈15·n² H·w kernel call, for the `bobyqb`
 /// sites that call `calvlag_into` then `calden_into` on the same `(kref, d, xpt, zmat, bmat)`.
 /// `vlag` (length npt + n) receives the `calvlag_lfqint` result (with the `+1` at `kref`); `den`
 /// (length npt) the `calden` result. Also returns BETA (the `calbeta` value the kernel derives
-/// on the way) so Tier B callers can thread it into `updateh` without a recompute.
+/// on the way) so same-iteration reuse can thread it into `updateh` without a recompute.
 /// Provenance: fuses `calvlag_lfqint` + `calden`; results are bit-identical to the two separate
 /// calls (one kernel; the `+1` is applied after the BETA read).
 #[expect(clippy::too_many_arguments)] // scratch params mirror the hoisted Fortran locals
@@ -390,8 +337,10 @@ pub(crate) fn calvlag_and_den_into(
         hdiag,
         ..
     } = cw;
-    // hdiag (idz = 1 specialization) — mirrors calden_into's hdiag (incl. its column-outer
-    // interchange); change together if the idz logic ever widens.
+    // PRIMA: hdiag = -sum(zmat(:, 1:idz-1)**2, dim=2) + sum(zmat(:, idz:)**2, dim=2) —
+    // the negative part is empty for idz = 1. Column-outer interchange:
+    // contiguous ZMAT columns instead of stride-npt rows; every hdiag[k] still accumulates
+    // its z² terms in ascending j, so the sums are bit-identical to the row-outer form.
     hdiag[..npt].fill(0.0);
     for j in 0..zmat.ncols() {
         let zj = &zmat.col(j)[..npt];
@@ -405,8 +354,9 @@ pub(crate) fn calvlag_and_den_into(
     );
     let beta = beta_from_noadd_vlag(d, xref, wcheck, vlag, n, npt);
     vlag[kref] += 1.0; // calvlag_into's `+1` — now `vlag` equals the calvlag_into output exactly.
+    // PRIMA: den = hdiag * beta + vlag(1:npt)**2.
     for k in 0..npt {
-        den[k] = hdiag[k] * beta + vlag[k] * vlag[k]; // == calden_into's output exactly.
+        den[k] = hdiag[k] * beta + vlag[k] * vlag[k];
     }
     beta
 }
@@ -454,36 +404,5 @@ mod tests {
             ),
             28.0
         );
-    }
-
-    #[test]
-    fn calden_into_matches_calvlag_and_den_into() {
-        // calvlag_and_den_into is documented bit-identical to calden_into on the same inputs — both
-        // add the `+1` at kref before squaring into den. That `+1` lives in ONE function each
-        // (calden_into L364, calvlag_and_den_into L413), so a mutation to either breaks this equality.
-        // Inputs give vlag_den[kref] = 1.5 (=> +1 -> 2.5), so the `+1` is observable in den[kref].
-        let (n, npt, kref) = (1, 3, 0);
-        let bmat = Mat::zeros(n, npt + n);
-        let xpt = Mat::from_col_major(n, npt, vec![1.0, 2.0, 0.0]);
-        let zmat = Mat::from_col_major(npt, npt - n - 1, vec![1.0, 0.0, -1.0]);
-        let d = [1.0];
-        let mut cw = CalWs::new(n, npt).unwrap();
-        let mut den_calden = vec![0.0; npt];
-        calden_into(kref, &bmat, &d, &xpt, &zmat, &mut cw, &mut den_calden);
-        let mut den_fused = vec![0.0; npt];
-        let mut vlag = vec![0.0; npt + n];
-        calvlag_and_den_into(
-            kref,
-            &bmat,
-            &d,
-            &xpt,
-            &zmat,
-            &mut cw,
-            &mut vlag,
-            &mut den_fused,
-        );
-        assert_eq!(den_calden, den_fused);
-        // Sanity: the +1 landed (vlag_den[kref] 1.5 -> 2.5); also kills the L413 `*=` directly.
-        assert_eq!(vlag[kref], 2.5);
     }
 }

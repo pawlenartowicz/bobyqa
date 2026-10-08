@@ -23,9 +23,10 @@ use alloc::vec::Vec;
 const GRID_SIZE_MAX: usize = 42;
 
 /// Reused scratch for `trsbox` — PRIMA's per-call locals, hoisted to the solver workspace
-/// (rust.md §4). Lifetime and contents per call are identical to the Fortran locals; only the
-/// allocation site moves: every field is re-initialized at the original allocation site, per
-/// call and per loop iteration where the original was in-loop. Field → Fortran-local map:
+/// so that `minimize` performs no heap allocation after `Bobyqa::new`. Lifetime and contents per
+/// call are identical to the Fortran locals; only the allocation site moves: every field is
+/// re-initialized at the original allocation site, per call and per loop iteration where the
+/// original was in-loop. Field → Fortran-local map:
 /// `gopt`/`pq`/`hq` the (possibly rescaled) GOPT/PQ/HQ copies, `xbdi`/`gnew`/`s`/`xnew`/
 /// `xtest`/`sbound`/`hdred`/`ssq`/`tanbd`/`sqdscr` their PRIMA namesakes, `dold` the L356/L544
 /// DOLD restore copies, `dred` the L441 reduced D, `hs` the `HESS_MUL` results, `dxpt`
@@ -82,7 +83,7 @@ impl TrsboxWs {
 /// PRIMA trustregion.f90 L22 `trsbox`: approximately solves
 /// `minimize Q(XOPT + D) s.t. ||D|| <= DELTA, SL <= XOPT + D <= SU` by truncated CG plus a
 /// 2-D boundary search. Writes the step into `d` and returns `crvmin`.
-// The lints below all stem from faithful-port discipline (rust.md §5): `trsbox` mirrors a wide,
+// The lints below all stem from faithful-port discipline: `trsbox` mirrors a wide,
 // long Fortran routine with PRIMA's identifiers, its `!(a > b)` NaN-propagating negations (the
 // shared transcription convention — never `a <= b`), `nint(sign(...))` -> `... as i32`, and the
 // `nactsav` isize bookkeeping; the explicit indexed loops mirror PRIMA's array order.
@@ -716,19 +717,18 @@ fn masked_inprod(x: &[f64], y: &[f64], xbdi: &[i32]) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    // The diff tests bind PRIMA's symbols (xopt/xpt, sl/su, hq_in) and `states`/`stats` side by
-    // side — faithful naming over clippy's similarity heuristic (rust.md §5).
+    // The diff tests bind PRIMA's symbols (xopt/xpt, sl/su, hq_in) side by side — faithful
+    // naming over clippy's similarity heuristic.
     #![expect(clippy::similar_names)]
 
     use super::*;
     use crate::mat::Mat;
-    use crate::test_support::{self, DiffStats};
+    use crate::test_support;
 
     #[test]
     fn trrad_matches_prima_on_every_captured_state() {
         let states = test_support::load_states("trrad");
         assert!(!states.is_empty());
-        let mut stats = DiffStats::default();
         for st in &states {
             let (e, x) = (&st.entry, &st.exit);
             let delta = trrad(
@@ -740,16 +740,14 @@ mod tests {
                 e.f64("gamma2"),
                 e.f64("ratio"),
             );
-            stats.f64("delta", delta, x.f64("delta"));
+            test_support::assert_bits("delta", delta, x.f64("delta"));
         }
-        stats.report("trrad");
     }
 
     #[test]
     fn trsbox_matches_prima_on_every_captured_state() {
         let states = test_support::load_states("trsbox");
         assert!(!states.is_empty());
-        let mut stats = DiffStats::default();
         for st in &states {
             let (e, x) = (&st.entry, &st.exit);
             let (gopt_in, pq_in) = (e.vec("gopt_in"), e.vec("pq_in"));
@@ -770,10 +768,9 @@ mod tests {
                 &mut d,
                 &mut ws,
             );
-            stats.f64("crvmin", crvmin, x.f64("crvmin"));
-            stats.slice("d", &d, &x.vec("d"));
+            test_support::assert_bits("crvmin", crvmin, x.f64("crvmin"));
+            test_support::assert_slice_bits("d", &d, &x.vec("d"));
         }
-        stats.report("trsbox");
     }
 
     #[test]

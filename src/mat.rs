@@ -1,8 +1,9 @@
-//! Minimal column-major matrix (design §3.2) — infrastructure, not a PRIMA port.
+//! Minimal column-major matrix — infrastructure, not a PRIMA port.
 //!
 //! A PRIMA array `A(nr, nc)` becomes a `Mat` with `a[[i, j]] = data[i + j*nr]`, 0-based; same
 //! memory order as Fortran, so index translation is mechanical and `A(:, k)` column slices are
 //! contiguous. No math methods: arithmetic stays in explicit loops that mirror PRIMA.
+#[cfg(test)]
 use alloc::vec;
 use alloc::vec::Vec;
 use core::ops::{Index, IndexMut};
@@ -14,9 +15,9 @@ pub(crate) struct Mat {
 }
 
 impl Mat {
-    /// Infallible zero matrix — test-only construction sites (safe-checks spec S2: the
+    /// Infallible zero matrix — test-only construction sites (the
     /// production construction path goes through [`Mat::try_zeros`]).
-    #[allow(dead_code)] // test modules only; production code must use try_zeros
+    #[cfg(test)]
     pub(crate) fn zeros(nrows: usize, ncols: usize) -> Self {
         Self {
             data: vec![0.0; nrows * ncols],
@@ -24,7 +25,7 @@ impl Mat {
         }
     }
 
-    /// Fallible zero matrix (safe-checks spec S2): an unsatisfiable allocation surfaces as
+    /// Fallible zero matrix: an unsatisfiable allocation surfaces as
     /// `Err` instead of aborting. `nrows * ncols` itself is unchecked — `ws_dims_ok` in
     /// `Bobyqa::new` has already rejected any `(n, npt)` whose buffer sizes could overflow.
     pub(crate) fn try_zeros(
@@ -37,7 +38,7 @@ impl Mat {
         })
     }
 
-    #[allow(dead_code)] // used by the test_support.rs parser and test modules (cfg(test) only)
+    #[cfg(test)] // the test_support.rs parser and test modules
     pub(crate) fn from_col_major(nrows: usize, ncols: usize, data: Vec<f64>) -> Self {
         assert_eq!(data.len(), nrows * ncols, "shape/data mismatch");
         Self { data, nrows }
@@ -72,13 +73,14 @@ impl Mat {
         (&mut lo[a * nr..(a + 1) * nr], &mut hi[..nr])
     }
 
-    /// Overwrites `self` with `src` (same shape) — workspace refill for the M2 reuse design.
+    /// Overwrites `self` with `src` (same shape); lets a reused solver refill its workspace
+    /// instead of reallocating.
     pub(crate) fn copy_from(&mut self, src: &Mat) {
         debug_assert_eq!(self.nrows, src.nrows, "copy_from: row mismatch");
         self.data.copy_from_slice(&src.data);
     }
 
-    /// Flat column-major view — used by the diff tests to compare whole matrices.
+    /// Flat column-major view.
     pub(crate) fn data(&self) -> &[f64] {
         &self.data
     }

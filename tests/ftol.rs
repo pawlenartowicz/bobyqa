@@ -1,9 +1,10 @@
-//! ftol spec §3: the opt-in f-tolerance stop.
+//! Tests for the opt-in f-tolerance stop.
 //!
-//! Test 1 of the spec — the untouched golden battery with `ftol` at its `None` default —
-//! lives in `tests/parity_prima.rs` and never sets the fields; nothing here re-proves it.
-//! This file covers the passive-placement proof (§3.2), the triggered stop (§3.3), and the
-//! restart precedence pinned in the spec's §2.
+//! The untouched golden battery with `ftol` at its `None` default lives in
+//! `tests/parity_prima.rs` and never sets the fields; nothing here re-proves it.
+//! This file covers the passive-placement proof, the triggered stop, and the restart
+//! precedence: when `ftol` and a restart would fire at the same `rho` reduction, `ftol` wins
+//! and the solve stops.
 
 use bobyqa::{Bobyqa, Config, RestartConfig, Status};
 
@@ -36,7 +37,7 @@ fn solve(
     (o.f, o.n_eval, o.status, x)
 }
 
-/// Spec §3.2: `Some(0.0)/Some(0.0)` must reproduce the default trajectory bit-for-bit
+/// `Some(0.0)/Some(0.0)` must reproduce the default trajectory bit-for-bit
 /// whenever no stage has exactly zero improvement — the proof that the check's PLACEMENT
 /// is passive (it reads best-f at the reduction site and changes nothing else).
 ///
@@ -101,7 +102,7 @@ fn zero_ftol_stops_on_exact_stagnation_of_a_quadratic() {
     }
 }
 
-/// Spec §3.3: a small `ftol_rel` on a smooth problem stops early as `FtolReached`, spends
+/// A small `ftol_rel` on a smooth problem stops early as `FtolReached`, spends
 /// fewer evaluations, and lands within `C * ftol_rel * max(|f_default|, 1)` of the default
 /// answer, C = 100 (documented safety factor over the per-stage tolerance).
 #[test]

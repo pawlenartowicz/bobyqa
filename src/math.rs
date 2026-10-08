@@ -1,7 +1,7 @@
-//! The `f64` math seam (rust.md §9): every float intrinsic the port uses that `core` lacks goes
+//! The `f64` math seam: every float intrinsic the port uses that `core` lacks goes
 //! through here, so the math backend is a one-file concern. Two backends: `std` intrinsics
 //! (default) and `libm` free functions (the `libm` feature — the `no_std` backend). When both
-//! features are on, `libm` wins: that combination is CI's bit-exact parity gate (`no_std` spec §6),
+//! features are on, `libm` wins: that combination is CI's bit-exact parity gate,
 //! running the full golden battery on libm math under a std test harness.
 //!
 //! `f64::abs` is `core`, so it needs no backend split. `powi` is not on the seam: its only sites

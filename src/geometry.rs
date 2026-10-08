@@ -1,5 +1,5 @@
 //! `geometry.f90` (PRIMA bobyqa module): `setdrop_tr` (pick the point to drop after a TR step)
-//! and `geostep` (geometry-improving step) — design §5.
+//! and `geostep` (geometry-improving step).
 //!
 //! Index convention: all indices 0-based, with two PRIMA encodings kept verbatim because their
 //! arithmetic bakes in 1-based values: `setdrop_tr`'s `KNEW = 0` sentinel maps to
@@ -32,36 +32,35 @@ pub(crate) struct GeostepWs {
     den: Vec<f64>,    // npt
     score: Vec<f64>,  // npt
     // geostep
-    zrow_knew: Vec<f64>,      // npt - n - 1
-    pqlag: Vec<f64>,          // npt
-    xopt: Vec<f64>,           // n
-    hm: Vec<f64>,             // n
-    glag: Vec<f64>,           // n
-    dderiv: Vec<f64>,         // npt
-    stplen: Mat,              // 3 x npt
-    isbd: Vec<[i64; 3]>,      // npt
-    xdiff: Vec<f64>,          // n
-    lfrac: Vec<f64>,          // n
-    ufrac: Vec<f64>,          // n
-    slbd_test: Vec<f64>,      // n
-    subd_test: Vec<f64>,      // n
-    vlag: Mat,                // 3 x npt
-    betabd: Mat,              // 3 x npt
-    predsq: Mat,              // 3 x npt
-    xline: Vec<f64>,          // n
-    den_line: Vec<f64>,       // npt
-    xcauchy: Vec<f64>,        // n
-    s: Vec<f64>,              // n
-    mask_free: Vec<bool>,     // n
-    xtemp: Vec<f64>,          // n
-    mask_fixl: Vec<bool>,     // n
-    mask_fixu: Vec<bool>,     // n
-    new_mask_free: Vec<bool>, // n
-    x: Vec<f64>,              // n
-    sxpt: Vec<f64>,           // npt
-    s_cauchy: Vec<f64>,       // n
-    den_cauchy: Vec<f64>,     // npt
-    dxpt: Vec<f64>,           // npt
+    zrow_knew: Vec<f64>,  // npt - n - 1
+    pqlag: Vec<f64>,      // npt
+    xopt: Vec<f64>,       // n
+    hm: Vec<f64>,         // n
+    glag: Vec<f64>,       // n
+    dderiv: Vec<f64>,     // npt
+    stplen: Mat,          // 3 x npt
+    isbd: Vec<[i64; 3]>,  // npt
+    xdiff: Vec<f64>,      // n
+    lfrac: Vec<f64>,      // n
+    ufrac: Vec<f64>,      // n
+    slbd_test: Vec<f64>,  // n
+    subd_test: Vec<f64>,  // n
+    vlag: Mat,            // 3 x npt
+    betabd: Mat,          // 3 x npt
+    predsq: Mat,          // 3 x npt
+    xline: Vec<f64>,      // n
+    den_line: Vec<f64>,   // npt
+    xcauchy: Vec<f64>,    // n
+    s: Vec<f64>,          // n
+    mask_free: Vec<bool>, // n
+    xtemp: Vec<f64>,      // n
+    mask_fixl: Vec<bool>, // n
+    mask_fixu: Vec<bool>, // n
+    x: Vec<f64>,          // n
+    sxpt: Vec<f64>,       // npt
+    s_cauchy: Vec<f64>,   // n
+    den_cauchy: Vec<f64>, // npt
+    dxpt: Vec<f64>,       // npt
     cal: CalWs,
 }
 
@@ -96,7 +95,6 @@ impl GeostepWs {
             xtemp: try_vec(0.0, n)?,
             mask_fixl: try_vec(false, n)?,
             mask_fixu: try_vec(false, n)?,
-            new_mask_free: try_vec(false, n)?,
             x: try_vec(0.0, n)?,
             sxpt: try_vec(0.0, npt)?,
             s_cauchy: try_vec(0.0, n)?,
@@ -112,8 +110,8 @@ impl GeostepWs {
 ///
 /// N.B. If `ximproved = true`, the result is always `Some(k)` with `k` a valid index.
 /// If `ximproved = false`, the result is never `Some(kopt)`.
-#[expect(clippy::needless_range_loop)] // explicit indexed loops mirror PRIMA (rust.md §5)
-#[expect(clippy::too_many_arguments)] // out-params mirror the Fortran intent (rust.md §5)
+#[expect(clippy::needless_range_loop)] // explicit indexed loops mirror PRIMA
+#[expect(clippy::too_many_arguments)] // out-params mirror the Fortran intent
 pub(crate) fn setdrop_tr(
     kopt: usize,
     ximproved: bool,
@@ -176,9 +174,9 @@ pub(crate) fn setdrop_tr(
         weight[k] = m2 * m2;
     }
 
-    // PRIMA geometry.f90 L134: den = calden. Layer-0 spec §5 (Tier B): when bobyqb already
+    // PRIMA geometry.f90 L134: den = calden. Same-iteration reuse: when bobyqb already
     // computed this exact DEN for (kopt, d, xpt, zmat, bmat) this iteration and no rescue has
-    // run since, reuse it by COPY (spec §4: buffer copy, never algebraic adjustment) — saves one
+    // run since, reuse it by COPY (a buffer copy, never an algebraic adjustment) — saves one
     // ≈15·n² kernel, bit-identically.
     match den_precomputed {
         Some(src) => den.copy_from_slice(src),
@@ -219,7 +217,7 @@ pub(crate) fn setdrop_tr(
 
     // PRIMA geometry.f90 L158–160: if ximproved and still None (all-NaN den path), fall back to
     // the farthest point. The `knew < 0` arm is impossible in the Rust representation (no negative
-    // Option<usize>) — not transcribed per §5 discipline.
+    // Option<usize>) — not transcribed.
     if ximproved && knew.is_none() {
         let mut best = distsq[0];
         let mut best_k = 0;
@@ -237,10 +235,10 @@ pub(crate) fn setdrop_tr(
 
 /// PRIMA geometry.f90 L178 `geostep`: compute a geometry-improving step D from XOPT.
 /// Writes D into `d` (length n, fully overwritten on every path).
-#[expect(clippy::too_many_arguments)] // out-params mirror the Fortran intent (rust.md §5)
-#[expect(clippy::too_many_lines)] // faithful port of PRIMA's 300-line geostep — rust.md §5
-#[expect(clippy::needless_range_loop)] // explicit indexed loops mirror PRIMA (rust.md §5)
-#[expect(clippy::similar_names)] // PRIMA identifiers: xopt/xpt, slbd/subd, ilbd/iubd/isbd/ibd, mask_fixl/mask_fixu — rust.md §5
+#[expect(clippy::too_many_arguments)] // out-params mirror the Fortran intent
+#[expect(clippy::too_many_lines)] // faithful port of PRIMA's 300-line geostep
+#[expect(clippy::needless_range_loop)] // explicit indexed loops mirror PRIMA
+#[expect(clippy::similar_names)] // PRIMA identifiers: xopt/xpt, slbd/subd, ilbd/iubd/isbd/ibd, mask_fixl/mask_fixu
 #[expect(clippy::cast_possible_wrap)] // isbd signed-1-based encoding: usize+1 fits i64 for realistic n — module header
 #[expect(clippy::cast_possible_truncation)] // sign(1.0, x) as i64: value is exactly ±1.0, no truncation — module header
 #[expect(clippy::cast_sign_loss)] // ibd→usize: always positive at use site (guarded by ibd<0/ibd>0) — module header
@@ -286,7 +284,6 @@ pub(crate) fn geostep(
         xtemp,
         mask_fixl,
         mask_fixu,
-        new_mask_free,
         x,
         sxpt,
         s_cauchy,
@@ -313,7 +310,6 @@ pub(crate) fn geostep(
     let xtemp = &mut xtemp[..n];
     let mask_fixl = &mut mask_fixl[..n];
     let mask_fixu = &mut mask_fixu[..n];
-    let new_mask_free = &mut new_mask_free[..n];
     let x = &mut x[..n];
     let s_cauchy = &mut s_cauchy[..n];
     let d = &mut d[..n];
@@ -443,7 +439,9 @@ pub(crate) fn geostep(
                     best_i = Some(i);
                 }
             }
-            let ilbd_pos = best_i.unwrap(); // always Some since any() passed on non-NaN elements
+            let Some(ilbd_pos) = best_i else {
+                unreachable!("any() passed, so a non-NaN element above -inf exists")
+            };
             slbd = slbd_test[ilbd_pos];
             // PRIMA: ilbd = -ilbd * nint(sign(ONE, xdiff(ilbd))) — signed 1-based
             ilbd = -((ilbd_pos + 1) as i64) * (1.0_f64.copysign(xdiff[ilbd_pos]) as i64);
@@ -471,7 +469,9 @@ pub(crate) fn geostep(
                     best_i = Some(i);
                 }
             }
-            let iubd_pos = best_i.unwrap(); // always Some since any() passed
+            let Some(iubd_pos) = best_i else {
+                unreachable!("any() passed, so a non-NaN element below +inf exists")
+            };
             subd = sumin.max(subd_test[iubd_pos]);
             // PRIMA: iubd = iubd * nint(sign(ONE, xdiff(iubd))) — signed 1-based
             iubd = ((iubd_pos + 1) as i64) * (1.0_f64.copysign(xdiff[iubd_pos]) as i64);
@@ -682,7 +682,7 @@ pub(crate) fn geostep(
                 mask_fixu[i] = s[i] >= bigstp && xtemp[i] >= su[i];
             }
             for i in 0..n {
-                new_mask_free[i] = s[i] >= bigstp && !(mask_fixl[i] || mask_fixu[i]);
+                mask_free[i] = s[i] >= bigstp && !(mask_fixl[i] || mask_fixu[i]);
             }
             // PRIMA: s(trueloc(mask_fixl)) = sl - xopt; s(trueloc(mask_fixu)) = su - xopt
             for i in 0..n {
@@ -702,11 +702,10 @@ pub(crate) fn geostep(
             // PRIMA: ggfree = sum(glag(trueloc(mask_free))**2)
             ggfree = 0.0;
             for i in 0..n {
-                if new_mask_free[i] {
+                if mask_free[i] {
                     ggfree += glag[i] * glag[i];
                 }
             }
-            mask_free.copy_from_slice(new_mask_free);
             // PRIMA: if (.not. (sfixsq > ssqsav .and. ggfree > 0)) exit
             if !(sfixsq > ssqsav && ggfree > 0.0) {
                 break;
@@ -813,7 +812,7 @@ pub(crate) fn geostep(
 mod tests {
     use super::*;
     use crate::mat::Mat;
-    use crate::test_support::{self, DiffStats};
+    use crate::test_support;
 
     #[test]
     fn setdrop_tr_matches_prima_on_every_captured_state() {
@@ -848,7 +847,6 @@ mod tests {
     fn geostep_matches_prima_on_every_captured_state() {
         let corpus = test_support::load_states("geostep");
         assert!(!corpus.is_empty());
-        let mut stats = DiffStats::default();
         for st in &corpus {
             let (e, x) = (&st.entry, &st.exit);
             let xpt = e.mat("xpt");
@@ -866,9 +864,8 @@ mod tests {
                 &mut d,
                 &mut ws,
             );
-            stats.slice("d", &d, &x.vec("d"));
+            test_support::assert_slice_bits("d", &d, &x.vec("d"));
         }
-        stats.report("geostep");
     }
 
     #[test]

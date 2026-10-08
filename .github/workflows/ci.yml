@@ -1,7 +1,7 @@
-# CI — the rust.md §13 checklist, on stable (no_std gates included since 0.3.0).
+# CI — the full check list, on stable (no_std gates included since 0.3.0).
 #
 # The test step IS the parity and allocation gate: the goldens live in-repo
-# (tests/goldens/), so PRIMA never builds here ("freeze then forget", roadmap).
+# (tests/goldens/), so PRIMA never builds here ("freeze then forget").
 name: CI
 
 on:
@@ -30,7 +30,7 @@ jobs:
       # 2. Lints.
       - run: cargo clippy --all-targets --locked -- -D warnings
 
-      # 3. Native tests — unit + parity battery (bit-exact goldens) + the SPEC §6.4
+      # 3. Native tests — unit + parity battery (bit-exact goldens) + the
       #    zero-allocation test — plus doctests.
       - run: cargo test --all-targets --locked
       # The kernel-invocation counter is feature-gated off by default (so the shipped lib carries
@@ -38,28 +38,34 @@ jobs:
       - run: cargo test --features count-kernels --test kernel_counts --locked
       - run: cargo test --doc --locked
 
-      # 3b. The libm parity gate (no_std spec §6): std + libm gives libm math under a std test
+      # 3b. The libm parity gate: std + libm gives libm math under a std test
       #     harness, so the FULL battery — every bit-exact golden — runs against the libm
       #     backend. If any golden moves by one bit, the no_std story stops here.
       - run: cargo clippy --all-targets --features libm --locked -- -D warnings
       - run: cargo test --all-targets --features libm --locked
 
-      # 4. wasm build gate (SPEC §1.2 firm target; no JS glue — rust.md §9).
+      # 4. wasm build gate (no JS glue).
       - run: cargo build --target wasm32-unknown-unknown --locked
 
-      # 5. wasm run gate (SPEC §6.5): the parity battery and the unit tests (the 32-bit
+      # 5. wasm run gate: the parity battery and the unit tests (the 32-bit
       #    size-overflow test among them) execute on wasm32-wasip1 under wasmtime. The --dir
       #    identity mapping preopens the workspace so the CARGO_MANIFEST_DIR-relative golden
       #    and state-dump paths baked into the test binaries resolve inside the guest.
-      #    Expectation: bit-exact, same as native (M2 design §7).
+      #    Expectation: bit-exact, same as native.
       - run: cargo test --target wasm32-wasip1 --lib --test parity_prima --locked
         env:
           CARGO_TARGET_WASM32_WASIP1_RUNNER: wasmtime run --dir ${{ github.workspace }}::${{ github.workspace }}
 
-      # 5b. no_std build gate (no_std spec §7.5): a bare-metal target has no std to fall back
+      # 5b. no_std build gate: a bare-metal target has no std to fall back
       #     on, so this is the proof that the crate is genuinely no_std + alloc. Compile-only;
       #     a bare target cannot run the harness (the libm parity gate above covers behaviour).
       - run: cargo build --no-default-features --features libm --target thumbv7em-none-eabihf --locked
 
-      # 6. Bench compile check (rust.md §13) — vacuously green until benches exist.
+      # 6. Bench compile check.
       - run: cargo bench --no-run --locked
+
+      # 7. MSRV gate: the library builds, in both math backends, on the `rust-version`
+      #    Cargo.toml declares. Library only — the dev-dependencies set their own MSRV.
+      - run: rustup toolchain install 1.85 --profile minimal
+      - run: cargo +1.85 build --locked
+      - run: cargo +1.85 build --no-default-features --features libm --locked

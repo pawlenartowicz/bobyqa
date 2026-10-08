@@ -3,9 +3,8 @@
 //! box-constrained local optimizer, ported from PRIMA's modern Fortran.
 //!
 //! Trajectory-parity-tested **bit-exact** against PRIMA (natively and on
-//! `wasm32-wasip1`) with [`Config::prima_parity`] set. The default differs from PRIMA
-//! only on a fully determined model (`npt = (n + 1)(n + 2) / 2`, so every `n = 1`
-//! problem), where PRIMA's RESCUE test fires on rounding alone; see that field.
+//! `wasm32-wasip1`). Setting [`Config::prima_parity`] to `false` opts into one deliberate
+//! deviation from PRIMA, only on a fully determined model; see that field.
 //!
 //! One public solver surface: [`Bobyqa`], the faithful PRIMA port. By default it
 //! stops as soon as `rho` reaches `rho_end`; setting [`Config::restart`] lets the
@@ -40,12 +39,17 @@
 #![forbid(unsafe_code)]
 #![no_std]
 
-// `Bobyqa` owns its buffers (allocated once in `new`), so the crate needs `alloc` but not `std`
-// (no_std spec D1). `std` is linked only for the default-on `std` feature (the `Error` impl)
+// `Bobyqa` owns its buffers (allocated once in `new`), so the crate needs `alloc` but not `std`.
+// `std` is linked only for the default-on `std` feature (the `Error` impl)
 // and for tests, which always build with std.
 extern crate alloc;
 #[cfg(any(feature = "std", test))]
 extern crate std;
+
+// Compiles the README examples as doctests (rustdoc only; never part of the built crate).
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;
 
 mod bobyqb;
 mod consts;
@@ -57,7 +61,7 @@ mod math;
 #[cfg(not(feature = "count-kernels"))]
 mod powalg;
 #[cfg(feature = "count-kernels")]
-pub mod powalg; // F0a: counter must be reachable from tests/kernel_counts.rs under this feature only
+pub mod powalg; // kernel-count instrumentation: the counter must be reachable from tests/kernel_counts.rs under this feature only
 mod rescue;
 #[cfg(test)]
 mod test_support;
@@ -65,7 +69,6 @@ mod trustregion;
 mod update;
 mod util;
 
-use alloc::vec::Vec;
 use consts::{
     BOUNDMAX, ETA1_DFT, ETA2_DFT, GAMMA1_DFT, GAMMA2_DFT, MAXFUN_DIM_DFT, RHOBEG_DFT, RHOEND_DFT,
 };
@@ -99,7 +102,7 @@ pub struct Config {
     /// around the best point found — see [`RestartConfig`] for what triggers that and what
     /// stops it. `max_fun` stays the TOTAL evaluation budget across all cycles.
     pub restart: Option<RestartConfig>,
-    /// Opt-in f-tolerance stopping (ftol spec): stop when the best f improves by less than
+    /// Opt-in f-tolerance stopping: stop when the best f improves by less than
     /// `ftol_rel * max(|f_best|, 1.0) + ftol_abs` over one full rho stage. With both `ftol`
     /// fields `None` (the default) the check is off — it is not even reached, so it cannot
     /// move the solve.
@@ -121,28 +124,36 @@ pub struct Config {
     /// if `Some`, finite and `>= 0.0`. Either field alone enables the check (the missing
     /// one contributes 0).
     pub ftol_abs: Option<f64>,
-    /// PRIMA parity switch. `false` (the default) applies this crate's deliberate deviations
-    /// from PRIMA; `true` reproduces PRIMA's BOBYQA bit for bit on every `n`.
+    /// PRIMA parity switch. `true` (the default) reproduces PRIMA's BOBYQA bit for bit on
+    /// every `n`; `false` applies this crate's deliberate deviation from PRIMA.
     ///
-    /// Today there is one deviation, and it applies only when `npt` is the maximum
-    /// `(n + 1)(n + 2) / 2`: the quadratic model is then fully determined by its points (and
-    /// at `n = 1` that maximum, 3, is the only legal `npt`). In that case the updating
-    /// formula's `beta` is zero in exact arithmetic, so each denominator `den[k]` equals
-    /// `vlag[k]^2` and PRIMA's test for calling RESCUE after a trust-region step,
-    /// `any(den > maxval(vlag^2))`, passes or fails on rounding alone. RESCUE then runs on
-    /// ordinary iterations and spends objective evaluations. With `prima_parity: false` that
-    /// test uses Powell's original factor, `any(den > 0.5 * maxval(vlag^2))` (PRIMA keeps it as
-    /// commented alternatives at `bobyqb.f90` L401-402), which still calls RESCUE on non-finite
-    /// values and on a denominator damaged well below `vlag^2`. Every `npt` below the maximum
-    /// runs PRIMA's code unchanged in both modes.
+    /// The deviation applies only when `npt` is the maximum `(n + 1)(n + 2) / 2`: the quadratic
+    /// model is then fully determined by its points (and at `n = 1` that maximum, 3, is the
+    /// only legal `npt`). Every `npt` below the maximum runs PRIMA's code unchanged in both
+    /// modes.
+    ///
+    /// With a fully determined model the updating formula's `beta` is zero in exact
+    /// arithmetic, so each denominator `den[k]` equals `vlag[k]^2` and PRIMA's test for calling
+    /// RESCUE after a trust-region step, `any(den > maxval(vlag^2))`, passes or fails on
+    /// rounding alone. RESCUE then runs on ordinary iterations and spends objective
+    /// evaluations. With `prima_parity: false` that test uses Powell's original factor,
+    /// `any(den > 0.5 * maxval(vlag^2))` (PRIMA keeps it as commented alternatives at
+    /// `bobyqb.f90` L401-402), which still calls RESCUE on non-finite values and on a
+    /// denominator damaged well below `vlag^2`.
+    ///
+    /// What to expect from `false`: on a one-dimensional quadratic objective it ends as low as
+    /// parity mode, within the solve's accuracy, usually in fewer evaluations. On other
+    /// objectives the two modes take different paths. `false` usually stops sooner, so at the
+    /// same `rho_end` it can end above parity mode, and on a problem with several local minima
+    /// the two modes can stop in different ones.
     pub prima_parity: bool,
 }
 
 impl Config {
     /// PRIMA's defaults for an `n`-dimensional problem.
     ///
-    /// The two derived defaults saturate instead of overflowing on absurd `n`
-    /// (safe-checks spec S1): a saturated `npt`/`max_fun` then fails [`Bobyqa::new`]'s
+    /// The two derived defaults saturate instead of overflowing on absurd `n`:
+    /// a saturated `npt`/`max_fun` then fails [`Bobyqa::new`]'s
     /// range checks, so no panic and no wrapped size can escape.
     #[must_use]
     pub fn new(n: usize) -> Self {
@@ -152,17 +163,16 @@ impl Config {
             rho_end: RHOEND_DFT,
             max_fun: MAXFUN_DIM_DFT.saturating_mul(n),
             // PRIMA's FTARGET_DFT is -REALMAX, which would terminate on f = -REALMAX;
-            // -inf is strictly "off" (design §4.2).
+            // -inf is strictly "off".
             f_target: f64::NEG_INFINITY,
-            // Off by default (stall-restart spec D5): existing users' numerics must not move.
+            // Off by default: existing users' numerics must not move.
             restart: None,
-            // Off by default (ftol spec §0 risk 2): None must be bit-identical to today.
+            // Off by default: `None` must not change the solve.
             ftol_rel: None,
             ftol_abs: None,
-            // Off: the deliberate deviations from PRIMA apply (see the field's docs). Changes
-            // results only for a fully determined model (`npt = (n + 1)(n + 2) / 2`, so every
-            // `n = 1` problem); everything else is bit-identical to `true`.
-            prima_parity: false,
+            // On: PRIMA's tests run literally. `false` opts into the deviation documented on
+            // the field.
+            prima_parity: true,
         }
     }
 }
@@ -192,7 +202,7 @@ pub enum Status {
     ModelDegenerate,
     /// Bad bounds, `npt`, or slice sizes.
     InvalidArgs,
-    /// [`Bobyqa::new`] could not allocate the solver workspace (safe-checks spec S2):
+    /// [`Bobyqa::new`] could not allocate the solver workspace:
     /// the allocator refused the request, or a buffer's byte size overflowed `isize`.
     /// Construction-time only — a built solver never allocates again.
     AllocationFailed,
@@ -239,10 +249,10 @@ pub const FUNCMAX: f64 = consts::FUNCMAX;
 /// The result of one [`Bobyqa::minimize`] or [`Bobyqa::minimize_with_radius`] call.
 #[derive(Debug, Clone, Copy)]
 pub struct Outcome {
-    /// Best objective value found. `NaN` when `status` is [`Status::InvalidArgs`] —
-    /// nothing was evaluated. A value `>= `[`FUNCMAX`] means every evaluated point was
-    /// non-finite (see [`FUNCMAX`]): the run is degenerate even if `status` is
-    /// [`Status::Converged`].
+    /// Best objective value found. `NaN` when nothing was evaluated:
+    /// `status` is [`Status::InvalidArgs`], or [`Status::AllocationFailed`] from [`bobyqa`].
+    /// A value `>= `[`FUNCMAX`] means every evaluated point was non-finite (see [`FUNCMAX`]):
+    /// the run is degenerate even if `status` is [`Status::Converged`].
     pub f: f64,
     /// Objective evaluations consumed.
     pub n_eval: usize,
@@ -257,8 +267,8 @@ impl Outcome {
     /// [`FUNCMAX`]) — a degenerate run, even when [`status`](Self::status) is
     /// [`Status::Converged`] (a flat moderated surface exits faithfully as PRIMA's
     /// `SMALL_TR_RADIUS`). Equivalent to `self.f < FUNCMAX`; prefer this at call
-    /// sites for intent. `NaN` `f` (the [`Status::InvalidArgs`] no-evaluation case)
-    /// is also reported as not-finite.
+    /// sites for intent. `NaN` `f` (the no-evaluation case: [`Status::InvalidArgs`] or
+    /// [`Status::AllocationFailed`]) is also reported as not-finite.
     #[must_use]
     pub fn found_finite(&self) -> bool {
         self.f < FUNCMAX
@@ -292,12 +302,11 @@ pub struct Bobyqa {
     /// allocation site; `minimize` re-initializes whatever it reads (the zero-alloc warm
     /// path, enforced by `tests/alloc.rs`).
     ws: bobyqb::SolverWs,
-    last_restarts: usize,
-    /// Per-cycle instrumentation backing store (stall-restart spec §5): sized
+    /// Per-cycle instrumentation backing store: sized
     /// `max_restarts + 1` in [`Bobyqa::new`] when restarts are enabled (empty otherwise), lent
     /// to the engine per call, so filling it — at most one entry per restart — never allocates
-    /// inside `minimize`.
-    cycle_boundaries: Vec<usize>,
+    /// inside `minimize`. Its length is the restart count of the last call.
+    cycle_boundaries: util::Reserved<usize>,
 }
 
 impl Bobyqa {
@@ -306,7 +315,7 @@ impl Bobyqa {
     /// # Errors
     ///
     /// [`Status::InvalidArgs`] when `(n, config)` is rejected: `n = 0`; an `(n, npt)`
-    /// whose workspace dimensions would overflow `usize` (safe-checks spec S1); `npt`
+    /// whose workspace dimensions would overflow `usize`; `npt`
     /// outside `n + 2 ..= (n + 1)(n + 2) / 2` (PRIMA's preprocessing would
     /// clamp; we reject); `rho_begin` not a positive finite number; `rho_end`
     /// not in `(0, rho_begin]`; `max_fun <= npt` (PRIMA preproc would raise; we
@@ -316,8 +325,8 @@ impl Bobyqa {
     /// zero or above [`MAX_RESTARTS_CAP`]; `improve_rel_tol` negative or NaN;
     /// `cycle_budget_frac` outside `[0.0, 1.0]` or NaN.
     ///
-    /// [`Status::AllocationFailed`] when the workspace allocation itself fails
-    /// (safe-checks spec S2) — the allocator refused, or a buffer's byte size overflowed
+    /// [`Status::AllocationFailed`] when the workspace allocation itself fails:
+    /// the allocator refused, or a buffer's byte size overflowed
     /// `isize`. The workspace is
     /// `(npt + 13)(npt + n) + 3n(n + 5)/2` doubles by Powell's working-space bound, plus
     /// this port's hoisted per-call scratch of the same order — roughly `O(npt^2 + n*npt)`
@@ -333,8 +342,8 @@ impl Bobyqa {
         if n == 0 {
             return Err(Status::InvalidArgs);
         }
-        // The S1 overflow gate, deliberately FIRST after `n == 0`: the range checks below
-        // (`n + 2`, `(n + 1)(n + 2) / 2`, `npt + 1`) and every workspace-buffer size
+        // The workspace-size overflow gate (`ws_dims_ok`), deliberately FIRST after `n == 0`: the
+        // range checks below (`n + 2`, `(n + 1)(n + 2) / 2`, `npt + 1`) and every workspace-buffer size
         // (`Mat::try_zeros` products, `2 * n + 1` in `SolverWs::new` — bounded by `npt + n`
         // once `npt >= n + 2` holds) compute unchecked arithmetic that is safe only once
         // this gate has passed. `Mat` indexing stays unchecked by the same reasoning:
@@ -357,12 +366,12 @@ impl Bobyqa {
         if config.max_fun < config.npt + 1 {
             return Err(Status::InvalidArgs);
         }
-        // NaN and +inf are both rejected (safe-checks spec S3.2): a target of +inf is never
+        // NaN and +inf are both rejected: a target of +inf is never
         // meaningful — the very first (moderated, hence finite) evaluation would "reach" it.
         if config.f_target.is_nan() || config.f_target == f64::INFINITY {
             return Err(Status::InvalidArgs);
         }
-        // ftol spec §1: each field, if set, must be finite and >= 0 (0.0 is legal — stops
+        // Each ftol field, if set, must be finite and >= 0 (0.0 is legal — stops
         // only on exact stagnation). NaN fails the `>= 0.0` half of the test.
         for tol in [config.ftol_rel, config.ftol_abs].into_iter().flatten() {
             if !(tol.is_finite() && tol >= 0.0) {
@@ -385,15 +394,13 @@ impl Bobyqa {
             n,
             config,
             ws: bobyqb::SolverWs::new(n, config.npt).map_err(|_| Status::AllocationFailed)?,
-            last_restarts: 0,
-            // The per-cycle instrumentation store (stall-restart spec §5): one slot per
+            // The per-cycle instrumentation store: one slot per
             // possible restart plus one spare, so `minimize` fills it without reallocating.
             // `max_restarts <= MAX_RESTARTS_CAP` above keeps the `+ 1` overflow-free.
-            cycle_boundaries: match config.restart {
-                Some(restart) => util::try_capacity(restart.max_restarts + 1)
-                    .map_err(|_| Status::AllocationFailed)?,
-                None => Vec::new(),
-            },
+            cycle_boundaries: util::try_capacity(
+                config.restart.map_or(0, |restart| restart.max_restarts + 1),
+            )
+            .map_err(|_| Status::AllocationFailed)?,
         })
     }
 
@@ -485,13 +492,12 @@ impl Bobyqa {
     /// current `(rho, delta)` before every evaluation; it never feeds back into the solve.
     fn run<F: FnMut(&[f64]) -> f64>(
         &mut self,
-        f: F,
+        mut f: F,
         x: &mut [f64],
         lower: &[f64],
         upper: &[f64],
         radius: Option<&Cell<TrustRadius>>,
     ) -> Outcome {
-        self.last_restarts = 0;
         self.cycle_boundaries.clear();
         if !prepare_call(self.n, &self.config, &mut self.ws, x, lower, upper) {
             // f is NaN because nothing was evaluated.
@@ -501,21 +507,16 @@ impl Bobyqa {
                 status: Status::InvalidArgs,
             };
         }
-        let rhobeg = self.config.rho_begin;
 
-        // The boundary store is lent to the engine by `take` (a pointer swap, no allocation)
-        // and recovered below, keeping `RestartState` free of borrows into `self`.
         let mut restart_state = self.config.restart.map(|rc| bobyqb::RestartState {
             config: rc,
-            restarts_done: 0,
             last_fopt: None,
             stall_count: 0,
             stall_fopt: None,
             nf_cycle_start: 0,
-            cycle_boundaries: core::mem::take(&mut self.cycle_boundaries),
+            cycle_boundaries: &mut self.cycle_boundaries,
         });
-        let mut f = f;
-        // ftol spec §2 shape guard: both-None must not even reach the check site — the
+        // Shape guard: both-None must not even reach the check site — the
         // engine takes `None` and the default path is the literal existing code.
         let ftol = if self.config.ftol_rel.is_none() && self.config.ftol_abs.is_none() {
             None
@@ -535,20 +536,16 @@ impl Bobyqa {
             ftol,
             GAMMA1_DFT,
             GAMMA2_DFT,
-            rhobeg,
+            self.config.rho_begin,
             self.config.rho_end,
             x,
             &mut self.ws,
             restart_state.as_mut(),
             radius,
-            // `Config::prima_parity`: Powell's RESCUE factor on a fully determined
-            // model only. `false` here is the literal PRIMA path.
+            // `Config::prima_parity`: the deviation applies on a fully determined model only.
+            // `false` here is the literal PRIMA path.
             !self.config.prima_parity && self.config.npt == (self.n + 1) * (self.n + 2) / 2,
         );
-        if let Some(rs) = restart_state {
-            self.last_restarts = rs.restarts_done;
-            self.cycle_boundaries = rs.cycle_boundaries;
-        }
         Outcome {
             f: fopt,
             n_eval: nf,
@@ -560,7 +557,7 @@ impl Bobyqa {
     /// call — always 0 when [`Config::restart`] is `None` (and before the first call).
     #[must_use]
     pub fn last_restart_count(&self) -> usize {
-        self.last_restarts
+        self.cycle_boundaries.len()
     }
 
     /// Cumulative evaluation count at each restart boundary of the last [`Bobyqa::minimize`]
@@ -577,9 +574,10 @@ impl Bobyqa {
 /// throwaway solver, and runs a single minimisation. **Allocates per call** — hot loops
 /// re-solving many problems of one size should build a [`Bobyqa`] once and reuse it.
 ///
-/// [`Bobyqa::new`] rejections (bad `npt`/`rho`/`max_fun`/`f_target`, or `x.len() == 0` — the
-/// same `n = 0` rejection as `new`) fold into the shape `minimize` already uses for runtime
-/// rejection: `Outcome { f: NaN, n_eval: 0, status: InvalidArgs }` — never a nested `Result`.
+/// [`Bobyqa::new`] errors ([`Status::InvalidArgs`] for bad `npt`/`rho`/`max_fun`/`f_target` or
+/// `x.len() == 0`, the same `n = 0` rejection as `new`; [`Status::AllocationFailed`]) fold into
+/// the shape `minimize` already uses for runtime rejection: `Outcome { f: NaN, n_eval: 0, status }`
+/// with that status — never a nested `Result`.
 ///
 /// # Panics
 ///
@@ -608,7 +606,7 @@ pub fn bobyqa<F: FnMut(&[f64]) -> f64>(
 ) -> Outcome {
     match Bobyqa::new(x.len(), config) {
         Ok(mut solver) => solver.minimize(f, x, lower, upper),
-        // `new` only ever fails with InvalidArgs; keep its word rather than re-spelling it.
+        // `new`'s error status (InvalidArgs or AllocationFailed) passes through unchanged.
         Err(status) => Outcome {
             f: f64::NAN,
             n_eval: 0,
@@ -617,12 +615,12 @@ pub fn bobyqa<F: FnMut(&[f64]) -> f64>(
     }
 }
 
-/// Upper bound on [`RestartConfig::max_restarts`] (safe-checks spec S2): far above any real
+/// Upper bound on [`RestartConfig::max_restarts`]: far above any real
 /// schedule (the recommended one is `1`), it exists so the `max_restarts + 1` instrumentation
 /// store can neither overflow nor become a caller-sized giant allocation.
 pub const MAX_RESTARTS_CAP: usize = 10_000;
 
-// The S1 overflow gate (safe-checks spec): every add/product any workspace buffer will
+// The workspace-size overflow gate: every add/product any workspace buffer will
 // compute, checked end to end. Sums are checked BEFORE their products — `npt + n`, `n + 1`,
 // `n + 2` can each wrap before a `checked_mul` ever runs (e.g. `n = usize::MAX - 1` makes
 // `n + 2` wrap to 0). On 32-bit targets (wasm32, thumbv7em) this is what stands between a
@@ -664,7 +662,7 @@ fn args_are_valid(n: usize, config: &Config, x: &[f64], lower: &[f64], upper: &[
 // `Bobyqa::minimize`'s per-call preamble: validate args,
 // clamp bounds into `ws`, preproc x0. Returns `false` (leaving `ws`/`x` untouched beyond
 // whatever `args_are_valid` itself reads) when the runtime args are rejected.
-#[expect(clippy::needless_range_loop)] // explicit indexed loops mirror PRIMA (rust.md §5)
+#[expect(clippy::needless_range_loop)] // explicit indexed loops mirror PRIMA
 fn prepare_call(
     n: usize,
     config: &Config,
@@ -678,41 +676,27 @@ fn prepare_call(
     }
     // PRIMA bobyqa.f90 L287-301: clamp bounds at +/-BOUNDMAX ("no bound" sentinel,
     // consts.F90 L172). NaN bounds were rejected above; only the magnitude clamp remains.
-    // The clamped copies live in the solver workspace (M2 §4: zero-alloc warm path).
+    // The clamped copies live in the workspace so that `minimize` allocates nothing per call.
     for i in 0..n {
         ws.bobyqb.xl[i] = lower[i].max(-BOUNDMAX);
         ws.bobyqb.xu[i] = upper[i].min(BOUNDMAX);
     }
-    let rhobeg = config.rho_begin;
 
     // PRIMA bobyqa.f90 L316: x = max(xl, min(xu, moderatex(x))) — in place, elementwise
-    // (each x[i] depends only on x[i], so the moderate-then-clamp order is FP-identical
-    // to the former moderatex-copy-then-clamp).
+    // (each x[i] depends only on x[i], so this is FP-identical
+    // to PRIMA's whole-array form).
     for i in 0..n {
         let xm = moderatex1(x[i]);
         x[i] = ws.bobyqb.xl[i].max(ws.bobyqb.xu[i].min(xm));
     }
 
-    // PRIMA preproc.f90 L341-350 (HONOUR_X0 = FALSE — the path the oracle runs; SPEC §7.6):
+    // PRIMA preproc.f90 L341-350 (HONOUR_X0 = FALSE — the path the oracle runs):
     // revise X0 so its distance to each inactive bound is 0 or >= rhobeg. Valid because
     // validation guarantees XU - XL >= 2*RHOBEG and X is in the box (the L338 precondition).
     // The follow-up rhobeg-revision block (preproc.f90 L367-383) is omitted: after this
     // revision it is "unnecessary in precise arithmetic" (PRIMA's own L368 N.B.), and its
     // rounding-error repairs fall under the no-repair stance — validation rejects, never fixes.
-    for i in 0..n {
-        if x[i] <= ws.bobyqb.xl[i] + 0.5 * rhobeg {
-            x[i] = ws.bobyqb.xl[i];
-        } else if x[i] < ws.bobyqb.xl[i] + rhobeg {
-            x[i] = ws.bobyqb.xl[i] + rhobeg;
-        }
-    }
-    for i in 0..n {
-        if x[i] >= ws.bobyqb.xu[i] - 0.5 * rhobeg {
-            x[i] = ws.bobyqb.xu[i];
-        } else if x[i] > ws.bobyqb.xu[i] - rhobeg {
-            x[i] = ws.bobyqb.xu[i] - rhobeg;
-        }
-    }
+    util::revise_x0(x, &ws.bobyqb.xl, &ws.bobyqb.xu, config.rho_begin);
     true
 }
 
@@ -802,8 +786,8 @@ impl Default for RestartConfig {
 }
 
 // The PRIMA-info -> `Status` mapping. `SMALL_TR_RADIUS` shares PRIMA's value 0 with `INFO_DFT`
-// (a normal loop exit IS convergence). `MAXTR_REACHED` is budget-class (`maxtr = 2 * max_fun` on
-// `Bobyqa`, scaled by `max_restarts + 1` when restarts are enabled to absorb a worst-case zero-eval
+// (a normal loop exit IS convergence). `MAXTR_REACHED` is budget-class (`maxtr = 2 * max_fun` with
+// restarts off, scaled by `max_restarts + 1` when restarts are enabled to absorb a worst-case zero-eval
 // iteration burst per restart cycle; near-unreachable on both paths). `NAN_INF_X`/`NAN_INF_F` are
 // `checkexit` defensive guards, near-unreachable
 // behind `moderatex`/`moderatef` — numerical-breakdown class. `NO_SPACE_BETWEEN_BOUNDS` is
@@ -821,7 +805,7 @@ fn status_from_info(info: i32) -> Status {
         FTOL_REACHED => Status::FtolReached,
         MAXFUN_REACHED | MAXTR_REACHED => Status::MaxFunReached,
         NAN_INF_MODEL | DAMAGING_ROUNDING | NAN_INF_X | NAN_INF_F => Status::ModelDegenerate,
-        // bobyqb's info set is closed; a new code here is a port bug or a spec amendment to
+        // bobyqb's info set is closed; a new code here is a port bug to
         // raise, never a silent mapping.
         other => {
             debug_assert!(false, "unmapped PRIMA info {other}");
@@ -838,6 +822,10 @@ mod tests {
         (2, Config::new(2))
     }
 
+    fn sphere(p: &[f64]) -> f64 {
+        p.iter().map(|v| v * v).sum()
+    }
+
     #[test]
     fn config_new_returns_prima_defaults() {
         let c = Config::new(3);
@@ -846,9 +834,9 @@ mod tests {
         assert_eq!(c.rho_end, 1e-6);
         assert_eq!(c.max_fun, 1500); // 500 * n
         assert_eq!(c.f_target, f64::NEG_INFINITY);
-        assert_eq!(c.ftol_rel, None); // ftol off by default (spec §0 risk 2)
+        assert_eq!(c.ftol_rel, None); // ftol off by default
         assert_eq!(c.ftol_abs, None);
-        assert!(!c.prima_parity); // deviations on by default
+        assert!(c.prima_parity); // deviations off by default
     }
 
     #[test]
@@ -935,7 +923,7 @@ mod tests {
                 }
             )
             .is_err()
-        ); // (only +inf was tested before)
+        );
         assert!(
             Bobyqa::new(
                 n,
@@ -958,7 +946,7 @@ mod tests {
             )
             .is_err()
         );
-        // f_target = +inf would "succeed" on the first evaluation (S3.2) — rejected like NaN;
+        // f_target = +inf would "succeed" on the first evaluation — rejected like NaN;
         // -inf stays the documented "off" default and must keep passing.
         assert!(
             Bobyqa::new(
@@ -999,7 +987,7 @@ mod tests {
 
     #[test]
     fn new_rejects_dimension_overflow_instead_of_panicking() {
-        // Config::new saturates its derived npt/max_fun; the S1 gate (or the range checks
+        // Config::new saturates its derived npt/max_fun; the overflow gate (or the range checks
         // the saturation then fails) must reject — in debug builds a panic here is the bug.
         for n in [usize::MAX, usize::MAX - 1, usize::MAX / 2] {
             assert!(matches!(
@@ -1014,8 +1002,8 @@ mod tests {
         assert!(matches!(Bobyqa::new(2, c), Err(Status::InvalidArgs)));
     }
 
-    // The S1 conditions are untestable with real allocations on 64-bit hosts; this runs on
-    // CI's wasm32 job (safe-checks spec S3.3): default npt at n = 65_535 makes npt * npt
+    // The overflow conditions are untestable with real allocations on 64-bit hosts; this runs on
+    // CI's wasm32 job: default npt at n = 65_535 makes npt * npt
     // (and the npt cap formula) overflow 32-bit usize.
     #[test]
     #[cfg(target_pointer_width = "32")]
@@ -1097,7 +1085,7 @@ mod tests {
         let o = s.minimize(
             |p: &[f64]| {
                 n_calls += 1;
-                p.iter().map(|v| v * v).sum::<f64>()
+                sphere(p)
             },
             &mut x,
             &[-5.0, -5.0],
@@ -1107,7 +1095,7 @@ mod tests {
         assert_eq!(o.n_eval, n_calls);
         assert!(o.f < 1e-8);
         assert!(x.iter().all(|v| v.abs() < 1e-3));
-        assert!(o.n_eval >= c.npt); // the npt model-building floor (SPEC §1)
+        assert!(o.n_eval >= c.npt); // the npt model-building floor
     }
 
     #[test]
@@ -1125,7 +1113,7 @@ mod tests {
                     first_x0 = p[0];
                     seen = true;
                 }
-                p.iter().map(|v| v * v).sum::<f64>()
+                sphere(p)
             },
             &mut x,
             &[1.0, -5.0],
@@ -1138,7 +1126,6 @@ mod tests {
     fn minimize_stops_on_f_target_and_on_the_budget() {
         let (n, c) = valid();
         let mut s = Bobyqa::new(n, Config { f_target: 0.5, ..c }).unwrap();
-        let sphere = |p: &[f64]| p.iter().map(|v| v * v).sum::<f64>();
         let o = s.minimize(sphere, &mut [1.0, 2.0], &[-5.0, -5.0], &[5.0, 5.0]);
         assert_eq!(o.status, Status::TargetReached);
         assert!(o.f <= 0.5);
@@ -1177,25 +1164,20 @@ mod tests {
 
         // A normal fit finds finite values → found_finite() == true.
         let mut s = Bobyqa::new(n, c).unwrap();
-        let good = s.minimize(
-            |p: &[f64]| p.iter().map(|v| v * v).sum::<f64>(),
-            &mut [1.0, 2.0],
-            &[-5.0, -5.0],
-            &[5.0, 5.0],
-        );
+        let good = s.minimize(sphere, &mut [1.0, 2.0], &[-5.0, -5.0], &[5.0, 5.0]);
         assert!(good.found_finite());
     }
 
     #[test]
     #[expect(clippy::many_single_char_names)] // n, c, s, x, o are PRIMA/test shorthands
     fn minimize_accepts_infinite_bounds_via_the_boundmax_clamp() {
-        // |bound| >= BOUNDMAX means "no bound" (design §4.2); minimize clamps to +/-BOUNDMAX
+        // |bound| >= BOUNDMAX means "no bound"; minimize clamps to +/-BOUNDMAX
         // (bobyqa.f90 L287-301) and must run, not panic.
         let (n, c) = valid();
         let mut s = Bobyqa::new(n, c).unwrap();
         let mut x = [1.0, 2.0];
         let o = s.minimize(
-            |p: &[f64]| p.iter().map(|v| v * v).sum::<f64>(),
+            sphere,
             &mut x,
             &[f64::NEG_INFINITY, -9.0],
             &[f64::INFINITY, 9.0],
@@ -1281,7 +1263,7 @@ mod tests {
             max_restarts: 0,
             ..r
         }));
-        // max_restarts <= MAX_RESTARTS_CAP (S2: kills both the `+ 1` overflow and the
+        // max_restarts <= MAX_RESTARTS_CAP (kills both the `+ 1` overflow and the
         // caller-sized giant boundary store); the cap itself is legal.
         assert!(!ok(RestartConfig {
             max_restarts: usize::MAX,
@@ -1337,13 +1319,7 @@ mod tests {
     fn one_shot_bobyqa_minimizes_and_folds_construction_errors_into_the_outcome() {
         // Happy path: same sphere as the reusable-solver test.
         let mut x = [1.0, 2.0];
-        let o = bobyqa(
-            |p: &[f64]| p.iter().map(|v| v * v).sum::<f64>(),
-            &mut x,
-            &[-5.0, -5.0],
-            &[5.0, 5.0],
-            Config::new(2),
-        );
+        let o = bobyqa(sphere, &mut x, &[-5.0, -5.0], &[5.0, 5.0], Config::new(2));
         assert_eq!(o.status, Status::Converged);
         assert!(o.f < 1e-8);
 

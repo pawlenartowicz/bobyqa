@@ -1,9 +1,10 @@
 //! `initialize.f90` (PRIMA bobyqa module): `initxf`, `initq`, `inith` — the `prelim` exemplar
-//! port (design §5).
+//! port.
 //!
 //! Index convention: all indices 0-based (`kopt`, `k`, `ij` pairs); the diff tests translate
 //! PRIMA's 1-based dump values. History (`xhist`/`fhist`) and `iprint`/`fmsg` are omitted
-//! (SPEC §7.6); info codes are `consts.rs` values.
+//! because the crate does no I/O (a caller records any trace in its own closure); info codes are
+//! `consts.rs` values.
 //!
 //! Dimensions: `xpt` n×npt, `bmat` n×(npt+n), `zmat` npt×(npt−n−1), `hq` n×n,
 //! `gopt`/`sl`/`su`/`xbase` n, `fval`/`pq` npt, `ij` len max(0, npt−2n−1).
@@ -49,7 +50,7 @@ impl InitWs {
 
 /// PRIMA initialize.f90 L22 `initxf`: initialize the interpolation points and their function
 /// values. Returns `(kopt 0-based, nf, info)`.
-#[expect(clippy::too_many_arguments)] // out-params mirror the Fortran intent (rust.md §5)
+#[expect(clippy::too_many_arguments)] // out-params mirror the Fortran intent
 pub(crate) fn initxf<F: FnMut(&[f64]) -> f64>(
     calfun: &mut F,
     maxfun: usize,
@@ -203,10 +204,9 @@ pub(crate) fn initxf<F: FnMut(&[f64]) -> f64>(
     (kopt, nf, info)
 }
 
-/// PRIMA initialize.f90 L309 `initq`: initialize the quadratic model [GOPT, HQ, PQ]. Returns
-/// `info` (NB: the `bobyqb.f90` call site on this pin omits the optional `info`, so the state
-/// corpus has no `info` field to diff — the value is still computed, faithfully to the Fortran
-/// body that runs under `present(info)`).
+/// PRIMA initialize.f90 L309 `initq`: initialize the quadratic model [GOPT, HQ, PQ]. The
+/// Fortran's optional `info` (L416-422, under `present(info)`) is not computed: `bobyqb.f90`
+/// never passes it, and tests the model's finiteness itself right after the call.
 pub(crate) fn initq(
     ij: &[(usize, usize)],
     fval: &[f64],
@@ -215,7 +215,7 @@ pub(crate) fn initq(
     hq: &mut Mat,
     pq: &mut [f64],
     ws: &mut InitWs,
-) -> i32 {
+) {
     let n = xpt.nrows();
     let npt = xpt.ncols();
 
@@ -225,7 +225,7 @@ pub(crate) fn initq(
     let fbase = fval[0];
 
     // PRIMA L376: GOPT = (FVAL(2:N+1) - FBASE) / DIAG(XPT(:, 2:N+1)) — the array-section diag
-    // becomes an indexed loop (Task 9 call-site convention): diag element i is XPT(i, i+1).
+    // becomes an indexed loop; diag element i is XPT(i, i+1).
     for i in 0..n {
         gopt[i] = (fval[i + 1] - fbase) / xpt[[i, i + 1]];
     }
@@ -281,24 +281,18 @@ pub(crate) fn initq(
 
     // PRIMA L414: PQ = ZERO.
     pq.fill(0.0);
-
-    // PRIMA L416-422: info (the Fortran computes it under `present(info)`).
-    if gopt.iter().any(|v| v.is_nan()) || hq.data().iter().any(|v| v.is_nan()) {
-        crate::consts::NAN_INF_MODEL
-    } else {
-        INFO_DFT
-    }
 }
 
 /// PRIMA initialize.f90 L438 `inith`: initialize [BMAT, ZMAT], representing the matrix H of
-/// (2.7) of the BOBYQA paper. Returns `info` (same `present(info)` note as [`initq`]).
+/// (2.7) of the BOBYQA paper. The Fortran's optional `info` (L532-538) is not computed, for the
+/// same reason as in [`initq`].
 pub(crate) fn inith(
     ij: &[(usize, usize)],
     xpt: &Mat,
     bmat: &mut Mat,
     zmat: &mut Mat,
     ws: &mut InitWs,
-) -> i32 {
+) {
     let n = xpt.nrows();
     let npt = xpt.ncols();
 
@@ -362,26 +356,18 @@ pub(crate) fn inith(
         zmat[[i + 1, k]] = -1.0 / rhosq;
         zmat[[j + 1, k]] = -1.0 / rhosq;
     }
-
-    // PRIMA L532-538: info (computed under `present(info)` in the Fortran).
-    if bmat.data().iter().any(|v| v.is_nan()) || zmat.data().iter().any(|v| v.is_nan()) {
-        crate::consts::NAN_INF_MODEL
-    } else {
-        INFO_DFT
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::mat::Mat;
-    use crate::test_support::{self, DiffStats};
+    use crate::test_support;
 
     #[test]
     fn initxf_matches_prima_on_every_captured_state() {
         let corpus = test_support::load_states("initxf");
         assert!(!corpus.is_empty());
-        let mut stats = DiffStats::default();
         for st in &corpus {
             let (e, x) = (&st.entry, &st.exit);
             let (xl, xu) = (e.vec("xl"), e.vec("xu"));
@@ -410,27 +396,25 @@ mod tests {
                 &mut xpt,
                 &mut ws,
             );
-            // Integer/index outputs: exact, with the 1-based -> 0-based translation (design §3.2).
+            // Integer/index outputs: exact, with the 1-based -> 0-based translation.
             assert_eq!(kopt + 1, x.usize("kopt"), "{}: kopt", st.problem);
             assert_eq!(nf, x.usize("nf"), "{}: nf", st.problem);
             assert_eq!(i64::from(info), x.i64("info"), "{}: info", st.problem);
             assert_eq!(ij, x.ij("ij"), "{}: ij", st.problem);
             // f64 outputs: within tolerance, bit-exactness tracked.
-            stats.slice("x0", &x0, &x.vec("x0"));
-            stats.slice("fval", &fval, &x.vec("fval"));
-            stats.slice("sl", &sl, &x.vec("sl"));
-            stats.slice("su", &su, &x.vec("su"));
-            stats.slice("xbase", &xbase, &x.vec("xbase"));
-            stats.mat("xpt", &xpt, &x.mat("xpt"));
+            test_support::assert_slice_bits("x0", &x0, &x.vec("x0"));
+            test_support::assert_slice_bits("fval", &fval, &x.vec("fval"));
+            test_support::assert_slice_bits("sl", &sl, &x.vec("sl"));
+            test_support::assert_slice_bits("su", &su, &x.vec("su"));
+            test_support::assert_slice_bits("xbase", &xbase, &x.vec("xbase"));
+            test_support::assert_mat_bits("xpt", &xpt, &x.mat("xpt"));
         }
-        stats.report("initxf");
     }
 
     #[test]
     fn initq_matches_prima_on_every_captured_state() {
         let corpus = test_support::load_states("initq");
         assert!(!corpus.is_empty());
-        let mut stats = DiffStats::default();
         for st in &corpus {
             let (e, x) = (&st.entry, &st.exit);
             let ij = e.ij("ij");
@@ -443,19 +427,17 @@ mod tests {
             let mut ws = InitWs::new(xpt.nrows(), xpt.ncols()).unwrap();
             // No `info` diff: the bobyqb.f90 call site on this pin omits the optional INFO, so
             // the guarded dump emits nothing (oracle/README.md, Instrumentation).
-            let _info = initq(&ij, &fval, &xpt, &mut gopt, &mut hq, &mut pq, &mut ws);
-            stats.slice("gopt", &gopt, &x.vec("gopt"));
-            stats.mat("hq", &hq, &x.mat("hq"));
-            stats.slice("pq", &pq, &x.vec("pq"));
+            initq(&ij, &fval, &xpt, &mut gopt, &mut hq, &mut pq, &mut ws);
+            test_support::assert_slice_bits("gopt", &gopt, &x.vec("gopt"));
+            test_support::assert_mat_bits("hq", &hq, &x.mat("hq"));
+            test_support::assert_slice_bits("pq", &pq, &x.vec("pq"));
         }
-        stats.report("initq");
     }
 
     #[test]
     fn inith_matches_prima_on_every_captured_state() {
         let corpus = test_support::load_states("inith");
         assert!(!corpus.is_empty());
-        let mut stats = DiffStats::default();
         for st in &corpus {
             let (e, x) = (&st.entry, &st.exit);
             let ij = e.ij("ij");
@@ -466,10 +448,9 @@ mod tests {
             let mut ws = InitWs::new(n, npt).unwrap();
             // No `info` diff: the bobyqb.f90 call site on this pin omits the optional INFO
             // (oracle/README.md, Instrumentation).
-            let _info = inith(&ij, &xpt, &mut bmat, &mut zmat, &mut ws);
-            stats.mat("bmat", &bmat, &x.mat("bmat"));
-            stats.mat("zmat", &zmat, &x.mat("zmat"));
+            inith(&ij, &xpt, &mut bmat, &mut zmat, &mut ws);
+            test_support::assert_mat_bits("bmat", &bmat, &x.mat("bmat"));
+            test_support::assert_mat_bits("zmat", &zmat, &x.mat("zmat"));
         }
-        stats.report("inith");
     }
 }

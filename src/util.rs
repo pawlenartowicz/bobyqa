@@ -11,7 +11,7 @@ use alloc::vec;
 
 /// Fallible `vec![value; len]`: reserves via `try_reserve_exact` so an out-of-memory
 /// (or byte-capacity-overflow) request surfaces as an `Err` instead of aborting the
-/// process (safe-checks spec S2). Construction-time only — the warm path never allocates.
+/// process. Construction-time only — the warm path never allocates.
 pub(crate) fn try_vec<T: Clone>(
     value: T,
     len: usize,
@@ -22,14 +22,42 @@ pub(crate) fn try_vec<T: Clone>(
     Ok(v)
 }
 
-/// Fallible `Vec::with_capacity(cap)` — same S2 contract as [`try_vec`], for the
-/// capacity-only stores that are filled later (`ij`, the restart boundary store).
+/// A `Vec` sized by capacity alone and filled later (`ij`, the restart boundary store), built by
+/// [`try_capacity`]. Its `Clone` carries the capacity over: `Vec::clone` keeps only `len` of it,
+/// which would leave a cloned solver to allocate on its first push inside `minimize`.
+#[derive(Debug)]
+pub(crate) struct Reserved<T>(alloc::vec::Vec<T>);
+
+impl<T: Clone> Clone for Reserved<T> {
+    fn clone(&self) -> Self {
+        let mut v = alloc::vec::Vec::with_capacity(self.0.capacity());
+        v.extend_from_slice(&self.0);
+        Self(v)
+    }
+}
+
+impl<T> core::ops::Deref for Reserved<T> {
+    type Target = alloc::vec::Vec<T>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<T> core::ops::DerefMut for Reserved<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+/// Fallible `Vec::with_capacity(cap)` — same fallible-allocation contract as [`try_vec`], for the
+/// capacity-only stores that are filled later.
 pub(crate) fn try_capacity<T>(
     cap: usize,
-) -> Result<alloc::vec::Vec<T>, alloc::collections::TryReserveError> {
+) -> Result<Reserved<T>, alloc::collections::TryReserveError> {
     let mut v = alloc::vec::Vec::new();
     v.try_reserve_exact(cap)?;
-    Ok(v)
+    Ok(Reserved(v))
 }
 
 /// PRIMA evaluate.f90 L27 `moderatex`, one element: NaN -> 0, then clamp to
@@ -71,6 +99,25 @@ pub(crate) fn evaluate<F: FnMut(&[f64]) -> f64>(
     } else {
         moderatex_into(x, xmod);
         moderatef(calfun(xmod))
+    }
+}
+
+/// PRIMA preproc.f90 L341-350 (`HONOUR_X0 = FALSE`): revise X0 so its distance to each inactive
+/// bound is 0 or >= `rhobeg`. Requires `xu - xl >= 2 * rhobeg` and `x` inside the box.
+pub(crate) fn revise_x0(x: &mut [f64], xl: &[f64], xu: &[f64], rhobeg: f64) {
+    for i in 0..x.len() {
+        if x[i] <= xl[i] + 0.5 * rhobeg {
+            x[i] = xl[i];
+        } else if x[i] < xl[i] + rhobeg {
+            x[i] = xl[i] + rhobeg;
+        }
+    }
+    for i in 0..x.len() {
+        if x[i] >= xu[i] - 0.5 * rhobeg {
+            x[i] = xu[i];
+        } else if x[i] > xu[i] - rhobeg {
+            x[i] = xu[i] - rhobeg;
+        }
     }
 }
 

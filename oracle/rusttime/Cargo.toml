@@ -1,0 +1,19 @@
+[package]
+name = "rusttime"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Path dependency: this harness times the working tree, not a crates.io release.
+[dependencies]
+bobyqa = { path = "../.." }
+# The competing pure-Rust BOBYQA in the three-way comparison; pinned so a table of
+# numbers in the crate README always names the version it was measured against.
+basin = "=1.5.1"
+
+# Match the crate's own release profile so the measurement reflects what a
+# downstream `--release` build actually gets.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

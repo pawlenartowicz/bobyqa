@@ -5,34 +5,71 @@ All notable changes to this crate are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.3.2] — Unreleased
+## [0.3.2] — 2026-10-08
 
-**With a default `Config`, every one-dimensional problem (and any problem run at the maximum
-`npt = (n + 1)(n + 2) / 2`) can now depart from PRIMA's trajectory; set the new
-`Config::prima_parity = true` to get PRIMA's trajectories bit for bit, as before.** Every other
-`npt` is unchanged, bit for bit, in both modes.
+Additive only: with a default `Config` every solve is unchanged, bit for bit. Setting the new
+`Config::prima_parity = false` lets every one-dimensional problem (and any problem run at the
+maximum `npt = (n + 1)(n + 2) / 2`) depart from PRIMA's trajectory; every other `npt` is
+unchanged, bit for bit, in both modes.
 
 ### Added
 
-- **`Config::prima_parity`** (default `false`). `true` reproduces PRIMA's BOBYQA bit for bit on
+- **`Config::prima_parity`** (default `true`). `true` reproduces PRIMA's BOBYQA bit for bit on
   every `n` (the PRIMA golden battery runs in this mode, natively, with `libm` and on
-  `wasm32-wasip1`). `false` applies the crate's deliberate deviations from PRIMA, of which
-  there is one, below. Future deviations, if any, join this switch.
-
-### Changed
-
-- **No spurious RESCUE on a fully determined model.** At `npt = (n + 1)(n + 2) / 2` (the only
+  `wasm32-wasip1`). `false` applies the crate's deliberate deviation from PRIMA, below. Future
+  deviations, if any, join this switch.
+- **Powell's RESCUE factor on a fully determined model.** At `npt = (n + 1)(n + 2) / 2` (the only
   legal `npt` when `n = 1`) the quadratic model is fully determined, the updating formula's
   `beta` is zero in exact arithmetic, and each denominator equals its `vlag` squared. PRIMA's
   trust-region test for calling RESCUE (`bobyqb.f90` L397, `any(den > maxval(vlag**2))`) is
   then decided by rounding alone: it fired on 16 of 26 improving steps of a one-dimensional
   REML-shaped objective and on 21 of 50 of two-dimensional Rosenbrock at `npt = 6`, each time
-  spending objective evaluations on a healthy model. With `prima_parity: false` the test uses
+  spending objective evaluations. With `prima_parity: false` the test uses
   Powell's original factor `0.5` (PRIMA's commented alternatives at L401-402), which still calls
-  RESCUE on non-finite values and on a denominator damaged well below `vlag**2`. On a 2,000-case
-  one-dimensional fuzz of quadratics with noise and random boxes the default took fewer
-  evaluations than parity mode in 1,251 cases, the same in 673 and more in 76, and never ended
-  above parity mode's final value beyond the solve's accuracy (`tests/one_dimensional.rs`).
+  RESCUE on non-finite values and on a denominator damaged well below `vlag**2`.
+
+On a 2,000-case one-dimensional fuzz of quadratics with noise and random boxes,
+`prima_parity: false` took fewer evaluations than parity mode in 1,251 cases, the same in 673
+and more in 76 (24,551 evaluations in total against 26,439). It never ended above parity mode's
+final value beyond the solve's accuracy (`tests/one_dimensional.rs`).
+
+On objectives that are not quadratic the two modes take different paths, and neither ends lower
+every time (`examples/prima_parity_probe.rs`):
+
+- On `sqrt|x - c|` (1,000 random one-dimensional cases) `false` ended higher than parity mode in
+  266 cases and lower in 189, with 26,971 evaluations against 29,556.
+- On five problems with `n` from 2 to 6, at the maximum `npt` and `rho_end = 1e-2`, it took 21%
+  to 36% fewer evaluations and ended higher from 24 to 77 of 100 starts.
+- At that `rho_end`, most of the higher finishes come from stopping sooner. With `rho_end` ten times smaller,
+  `false` ended lower than parity mode from 84 to 100 of the same 100 starts, using between 30%
+  fewer and 19% more evaluations.
+- On problems with several local minima the modes can stop in different ones. On Rosenbrock at
+  `n = 4` and `rho_end = 1e-8`, 6 starts ended higher and 5 lower.
+
+### Changed
+
+- Geometry-improving iterations now hand their VLAG/BETA kernel result to the H update instead
+  of recomputing it, as trust-region iterations have since 0.1.1; reuse is by copy,
+  bit-identical. Kernel invocations per solve fall from 61 to 37 on the sphere at `n = 2` and
+  `n = 10` and from 119 to 77 on the `booth_rescue` problem (`tests/kernel_counts.rs`).
+- The alternative-model test after a trust-region step skips computing the alternative model
+  when `ratio > 0.1`, where the result cannot be used, and the H update writes BMAT in one
+  pass instead of two — bit-identical results.
+
+### Fixed
+
+- **A restart-enabled solver allocated after an objective panic.** If the objective panicked
+  inside `minimize` and the caller caught the unwind, the solver lost its pre-sized
+  restart-boundary store, and every later `minimize` on it that restarted allocated. Results
+  were unaffected. Present since 0.2.0; the store now stays in the solver across an unwind
+  (`tests/alloc.rs`).
+- **A cloned solver could allocate inside `minimize`.** `Vec::clone` keeps a vector's length but
+  not its reserved capacity, so a clone of a `Bobyqa` lost the spare capacity of the pre-sized
+  restart-boundary store and of the two SETIJ pair stores. The clone then allocated when a solve
+  pushed more entries to one of them than it held when cloned. For a clone taken before the
+  first `minimize` that was the first push: with `npt > 2n + 1`, or when a restart fired.
+  Results were unaffected. Present since 0.1.0 (the restart store since 0.2.0); a clone now
+  keeps the capacity (`tests/alloc.rs`).
 
 ## [0.3.1] — 2026-10-02
 
@@ -56,20 +93,20 @@ against the PRIMA goldens.
 
 ### Added
 
-- **Opt-in f-tolerance stopping** (ftol spec): `Config::ftol_rel` / `Config::ftol_abs`
+- **Opt-in f-tolerance stopping:** `Config::ftol_rel` / `Config::ftol_abs`
   (both default `None`: off, bit-exact PRIMA). Stop when the best f improves by less than
   `ftol_rel * max(|f_best|, 1) + ftol_abs` over one full rho stage — checked only at the
   rho-reduction site, never during the first stage, never once `rho` reaches `rho_end`.
   A triggered stop returns the new `Status::FtolReached`, a converged-class outcome that
   does not spend a `Config::restart` cycle (ftol wins when both would fire at the same
   reduction).
-- **Fallible workspace allocation** (safe-checks spec S2): every construction-time buffer
+- **Fallible workspace allocation**: every construction-time buffer
   now allocates via `try_reserve_exact`; an allocation the platform cannot satisfy returns
   the new `Status::AllocationFailed` from `Bobyqa::new` instead of aborting the process
   (previously `vec![]` aborted — fatal on `no_std`/embedded). The warm path was and stays
   allocation-free (`tests/alloc.rs`). `Bobyqa::new`'s docs now state the workspace size
   formula so callers on big problems can budget.
-- **Workspace-size overflow gate** (safe-checks spec S1): `Bobyqa::new` validates every
+- **Workspace-size overflow gate**: `Bobyqa::new` validates every
   derived dimension sum/product with checked arithmetic before sizing anything, rejecting
   as `InvalidArgs` any `(n, npt)` whose buffer sizes would overflow `usize`. Previously
   debug builds panicked (contradicting the "Panics: never" docs) and release builds
@@ -79,8 +116,8 @@ against the PRIMA goldens.
   `#[cfg(target_pointer_width = "32")]` rejection test that CI's wasm32 job executes.
 - **`MAX_RESTARTS_CAP`** (= 10 000): `RestartConfig::max_restarts` above it is rejected,
   closing both a `+ 1` overflow and a caller-sized giant allocation of the per-cycle
-  boundary store (safe-checks spec S2).
-- **Hardening tests** (safe-checks spec S3): reuse after an objective panic reproduces a
+  boundary store.
+- **Hardening tests**: reuse after an objective panic reproduces a
   clean solver's trajectory bit-for-bit (`tests/safety.rs` pins the documented
   "re-initializes whatever it reads" contract), and `f_target = +inf` — which would
   "succeed" on the first evaluation — is now rejected like NaN.
@@ -214,6 +251,7 @@ Initial release.
   only); deterministic — no RNG, global state, threads, or I/O; invalid
   arguments are returned as a `Status`, never panicked.
 
+[0.3.2]: https://github.com/pawlenartowicz/bobyqa/releases/tag/v0.3.2
 [0.3.1]: https://github.com/pawlenartowicz/bobyqa/releases/tag/v0.3.1
 [0.3.0]: https://github.com/pawlenartowicz/bobyqa/releases/tag/v0.3.0
 [0.2.0]: https://github.com/pawlenartowicz/bobyqa/releases/tag/v0.2.0

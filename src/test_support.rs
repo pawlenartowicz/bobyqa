@@ -1,24 +1,14 @@
-//! Test-only support: the "bobyqa state v1" parser, diff assertions with bit-exactness tracking,
-//! and the Rust problem registry for replaying captured states (design §3.6-3.8).
+//! Test-only support: the "bobyqa state v1" parser, bit-exact diff assertions,
+//! and the Rust problem registry for replaying captured states.
 
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::string::{String, ToString};
 use std::vec::Vec;
-use std::{eprintln, format, vec};
+use std::{format, vec};
 
 use crate::mat::Mat;
-
-/// Subroutine-diff tolerance (design §3.7): integer/index/flag outputs match exactly; f64 outputs
-/// per-element within `|a-b| <= REL_TOL * max(|a|, |b|)`, bit-exactness tracked and reported.
-///
-/// Calibrated on the M1a `prelim` corpus (2026-06-04, PRIMA `1d76fb88`, gfortran 15.2.1,
-/// `-ffp-contract=off`): 3674 f64 outputs (initxf 1050, initq 468, inith 2156), 100% bit-exact,
-/// max rel dev 0. Kept at 1e-14 rather than 0: the FP pin makes `prelim` exactly reproducible,
-/// but M1b's heavier routines will accumulate ulp-level reduction differences (design §3.7 —
-/// any `prelim` deviation above this is a bug, not a tolerance problem).
-pub(crate) const STATE_DIFF_REL_TOL: f64 = 1e-14;
 
 const STATE_MAGIC: &str = "# bobyqa state v1";
 
@@ -84,7 +74,7 @@ impl Section {
         }
     }
 
-    /// PRIMA's 1-based IJ(2, m) -> 0-based (i, j) pairs (design §3.2 sentinel/index translation).
+    /// PRIMA's 1-based IJ(2, m) -> 0-based (i, j) pairs (sentinel/index translation).
     pub(crate) fn ij(&self, name: &str) -> Vec<(usize, usize)> {
         match self.get(name) {
             Value::IMatrix { nrows, data } => {
@@ -203,63 +193,30 @@ pub(crate) fn load_states(routine: &str) -> Vec<State> {
 }
 
 // ---------------------------------------------------------------------------
-// Diff assertions (design §3.7): exact ints, relative-tol floats, bit-exactness tracked.
+// Diff assertions: every f64 output must equal the captured PRIMA value bit for bit.
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Default)]
-pub(crate) struct DiffStats {
-    pub(crate) checked: usize,
-    pub(crate) bit_exact: usize,
-    pub(crate) max_rel: f64,
+pub(crate) fn assert_bits(what: &str, got: f64, want: f64) {
+    assert!(
+        got.to_bits() == want.to_bits(),
+        "{what}: got {got:e}, want {want:e}"
+    );
 }
 
-impl DiffStats {
-    pub(crate) fn f64(&mut self, what: &str, got: f64, want: f64) {
-        self.checked += 1;
-        if got.to_bits() == want.to_bits() {
-            self.bit_exact += 1;
-            return;
-        }
-        // Design §3.7 in inequality form — no division, so signed-zero pairs (-0.0 vs 0.0:
-        // bit-different but |a-b| = 0) pass instead of tripping on rel = 0/0 = NaN.
-        let scale = got.abs().max(want.abs());
-        let diff = (got - want).abs();
-        assert!(
-            diff <= STATE_DIFF_REL_TOL * scale,
-            "{what}: got {got:e}, want {want:e}, rel {:e} > {STATE_DIFF_REL_TOL:e}",
-            diff / scale
-        );
-        if scale > 0.0 {
-            self.max_rel = self.max_rel.max(diff / scale);
-        }
+pub(crate) fn assert_slice_bits(what: &str, got: &[f64], want: &[f64]) {
+    assert_eq!(got.len(), want.len(), "{what}: length");
+    for (k, (g, w)) in got.iter().zip(want).enumerate() {
+        assert_bits(&format!("{what}[{k}]"), *g, *w);
     }
+}
 
-    pub(crate) fn slice(&mut self, what: &str, got: &[f64], want: &[f64]) {
-        assert_eq!(got.len(), want.len(), "{what}: length");
-        for (k, (g, w)) in got.iter().zip(want).enumerate() {
-            self.f64(&format!("{what}[{k}]"), *g, *w);
-        }
-    }
-
-    pub(crate) fn mat(&mut self, what: &str, got: &Mat, want: &Mat) {
-        assert_eq!(
-            (got.nrows(), got.ncols()),
-            (want.nrows(), want.ncols()),
-            "{what}: shape"
-        );
-        self.slice(what, got.data(), want.data());
-    }
-
-    /// Print the calibration summary (visible with `--nocapture`; Task 15 reads it).
-    pub(crate) fn report(&self, label: &str) {
-        eprintln!(
-            "{label}: {} values, {} bit-exact ({:.1}%), max rel dev {:e}",
-            self.checked,
-            self.bit_exact,
-            100.0 * self.bit_exact as f64 / self.checked.max(1) as f64,
-            self.max_rel
-        );
-    }
+pub(crate) fn assert_mat_bits(what: &str, got: &Mat, want: &Mat) {
+    assert_eq!(
+        (got.nrows(), got.ncols()),
+        (want.nrows(), want.ncols()),
+        "{what}: shape"
+    );
+    assert_slice_bits(what, got.data(), want.data());
 }
 
 // ---------------------------------------------------------------------------
@@ -341,20 +298,8 @@ scalar info 0
     }
 
     #[test]
-    fn diff_stats_track_bit_exactness_and_tolerance() {
-        let mut s = DiffStats::default();
-        s.f64("a", 1.0, 1.0);
-        s.f64("b", 1.0, 1.0 + 1e-15); // within 1e-14
-        assert_eq!((s.checked, s.bit_exact), (2, 1));
-        // Pin the actual tracked deviation, not just `> 0`: max_rel = |1.0 - (1.0+1e-15)| / scale,
-        // a deterministic IEEE-754 value. A bare `> 0` passes even if max_rel were computed wrongly,
-        // silently breaking the calibration summary that every replay test relies on.
-        assert_eq!(s.max_rel, 1.110_223_024_625_155_4e-15);
-    }
-
-    #[test]
-    #[should_panic(expected = "rel")]
-    fn diff_stats_fail_beyond_the_tolerance() {
-        DiffStats::default().f64("x", 1.0, 1.001);
+    #[should_panic(expected = "want")]
+    fn assert_bits_fails_on_a_one_ulp_difference() {
+        assert_bits("x", 1.0, 1.0 + f64::EPSILON);
     }
 }

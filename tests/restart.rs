@@ -188,7 +188,7 @@ fn a_reused_solver_repeats_a_restart_run_exactly() {
     );
 }
 
-// Spec §5.4, degenerate case 1: the opening solve exits before `rho_end`, so the restart hook is
+// Degenerate case 1: the opening solve exits before `rho_end`, so the restart hook is
 // never reached — `last_restart_count() == 0` and the run is restart-off's, exactly. `f_target`
 // at 1e9 is satisfied by the very first evaluation, which is the cheapest way to make the hook
 // unreachable (every termination other than the `rho_end` path bypasses it).
@@ -265,7 +265,7 @@ fn a_restart_never_downgrades_a_converged_answer_to_model_degenerate() {
     const N: usize = 8;
     let mut cfg = Config::new(N);
     cfg.npt = (N + 1) * (N + 2) / 2; // 45 — fully determined, NOT the 2n+1 default
-    cfg.prima_parity = true; // the default config makes no RESCUE call on this solve
+    cfg.prima_parity = true; // with `false` this solve makes no RESCUE call
     let x0: Vec<f64> = (0..N)
         .map(|i| if i % 2 == 0 { -1.2 } else { 1.0 })
         .collect();
@@ -417,7 +417,7 @@ fn productive_reductions_never_trip_the_stall_trigger() {
     }
 }
 
-// ---- The eval cap, the rebuild, and D3's monotone incumbent ----
+// ---- The eval cap, the rebuild, and the monotone incumbent ----
 
 /// The cap-firing configuration: Rosenbrock crawls its rho schedule so slowly toward a
 /// 1e-10 `rho_end` that a 120-eval budget runs out with `rho` far from done. Neither the
@@ -511,7 +511,7 @@ fn the_recommended_schedule_is_bit_identical_on_a_solve_that_settles_inside_its_
 
 #[test]
 fn a_restart_returns_no_worse_than_its_cut_point() {
-    // D3: the returned point is a monotone incumbent across cycles. Strongest observable
+    // The returned point is a monotone incumbent across cycles. Strongest observable
     // form: the returned f equals the minimum over EVERY evaluation of the whole solve —
     // in particular it is no worse than the best at any restart's cut point, even though
     // each rebuild discards the model and every rebuilt point may be worse.
